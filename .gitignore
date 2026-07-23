@@ -1,0 +1,20 @@
+﻿# Python environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary images from camera and processing
+tmp_images/*
+!tmp_images/.gitkeep
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
