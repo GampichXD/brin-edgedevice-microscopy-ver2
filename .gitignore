@@ -1,16 +1,24 @@
-﻿# Python environment
+# Python environment
 venv/
 env/
 .venv/
 
 # Python cache
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
 # Temporary images from camera and processing
 tmp_images/*
 !tmp_images/.gitkeep
+
+# Local datasets
+local_datasets/*
+!local_datasets/.gitkeep
+
+# Duplicate / nested temporary directories
+Hardware/
 
 # Logs
 *.log
