@@ -1,0 +1,36 @@
+﻿# ============================================================
+# Requirements -- ALL Tile Stitching scripts
+#   SIFT_BFMatcher.py
+#   SIFT_LightGlue_Stitching.py
+#   SuperPoint_LightGlue_Stitching.py
+#   LoFTR_Stitching.py
+#   EfficientLoFTR_Stitching.py
+#
+# Python >= 3.9 recommended (tested on 3.11)
+# ============================================================
+# STEP 1 -- Install PyTorch (choose ONE matching your hardware):
+#
+#   GPU (CUDA 12.1):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+#   GPU (CUDA 11.8):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+#   CPU-only:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# STEP 2 -- Install all remaining packages:
+#     pip install -r requirements.txt
+# ============================================================
+
+# --- Deep-learning matchers ---
+# LightGlue (SuperPoint + SIFT + LightGlue matcher)
+lightglue @ git+https://github.com/cvg/LightGlue.git
+
+# --- Computer-vision core ---
+opencv-python>=4.8.0
+numpy>=1.24.0,<2.0.0
+
+# --- Visualisation & metrics ---
+matplotlib>=3.7.0
+scikit-image>=0.21.0
