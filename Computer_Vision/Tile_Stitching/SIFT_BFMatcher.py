@@ -1110,7 +1110,8 @@ def visualize_blending_debug(debug_info, final_image):
 # ============================================================
 
 if __name__ == '__main__':
-    folder_path = "/content/drive/MyDrive/Euglena_tiles/Euglena_Cap_jpg"   # ← change this
+    base_dir = Path(__file__).resolve().parent.parent
+    folder_path = base_dir / "Euglena_Tiles" / "7x7"
 
     # Step 1
     image_data, grid_info = load_image(folder_path, CONFIG['resize_factor'])

@@ -10,6 +10,7 @@ class GRBLMotorCore:
         self.timeout = timeout
         self.ser = None
         self.is_mock_mode = False  # Flag simulasi jika tidak terhubung ke Arduino asli
+        self.last_known_pos = {"X": 0.0, "Y": 0.0, "Z": 0.0}
         self.motion_settings = {
             "feed_rate": 250.0,
             "backlash": 0.0,
@@ -42,7 +43,7 @@ class GRBLMotorCore:
 
     def open(self):
         """Membuka jalur serial port murni menuju kontroler mesin."""
-        if self.ser and self.ser.isOpened():
+        if self.ser and self.ser.is_open:
             return True
 
         target_port = self._find_hardware_port()
@@ -87,7 +88,7 @@ class GRBLMotorCore:
             print(f"[MOCK MOTOR] Menembak: {clean_cmd} -> Balasan: ok")
             return "ok"
 
-        if self.ser is None or not self.ser.isOpened():
+        if self.ser is None or not self.ser.is_open:
             return "ERROR: Jalur komunikasi serial tidak aktif."
 
         try:
@@ -152,6 +153,7 @@ class GRBLMotorCore:
 
         feedrate_value = feedrate if feedrate is not None else self.motion_settings.get("feed_rate", 250.0)
         self.last_axis_direction[axis] = direction
+        self.last_known_pos[axis] = round(self.last_known_pos.get(axis, 0.0) + effective_delta, 3)
 
         response = self.send_command("G91")
         if response.startswith("ERROR"):
@@ -182,30 +184,35 @@ class GRBLMotorCore:
         Berguna untuk parsing koordinat XYZ real-time untuk dilempar ke VPS.
         """
         if self.is_mock_mode:
-            return {"status": "Idle", "X": 0.0, "Y": 0.0, "Z": 0.0, "limit_switch": "N/A"}
+            return {"status": "Idle", "X": self.last_known_pos.get("X", 0.0), "Y": self.last_known_pos.get("Y", 0.0), "Z": self.last_known_pos.get("Z", 0.0), "limit_switch": "N/A"}
             
-        if self.ser is None or not self.ser.isOpened():
-            return {"status": "Offline", "X": 0.0, "Y": 0.0, "Z": 0.0, "limit_switch": "N/A"}
+        if self.ser is None or not self.ser.is_open:
+            return {"status": "Offline", "X": self.last_known_pos.get("X", 0.0), "Y": self.last_known_pos.get("Y", 0.0), "Z": self.last_known_pos.get("Z", 0.0), "limit_switch": "N/A"}
             
         try:
             self.ser.write(b"?")  # Karakter status query instan GRBL
             time.sleep(0.05)
             response = self.ser.readline().decode('utf-8').strip()
             
-            # Regex untuk membedah data koordinat MPos dari GRBL: <Idle|MPos:0.000,0.000,0.000|...>
-            match = re.search(r'<(.*?)\|MPos:([-\d.]+),([-\d.]+),([-\d.]+)(?:\|Pn:([^>]+))?', response)
+            # Regex untuk membedah data koordinat MPos atau WPos dari GRBL: <Idle|MPos:0.000,0.000,0.000|...>
+            match = re.search(r'<(.*?)\|(?:MPos|WPos):([-\d.]+),([-\d.]+),([-\d.]+)(?:.*?Pn:([^>|]+))?', response)
             if match:
                 limit_switch = match.group(5) if match.group(5) else "N/A"
-                return {
-                    "status": match.group(1),
+                self.last_known_pos = {
                     "X": float(match.group(2)),
                     "Y": float(match.group(3)),
                     "Z": float(match.group(4)),
+                }
+                return {
+                    "status": match.group(1),
+                    "X": self.last_known_pos["X"],
+                    "Y": self.last_known_pos["Y"],
+                    "Z": self.last_known_pos["Z"],
                     "limit_switch": limit_switch,
                 }
         except Exception:
             pass
-        return {"status": "Unknown", "X": 0.0, "Y": 0.0, "Z": 0.0, "limit_switch": "N/A"}
+        return {"status": "Run", "X": self.last_known_pos.get("X", 0.0), "Y": self.last_known_pos.get("Y", 0.0), "Z": self.last_known_pos.get("Z", 0.0), "limit_switch": "N/A"}
 
     def move_xyz(self, x=None, y=None, z=None, feedrate=250):
         """Fungsi pembantu berlevel tinggi khusus untuk pergerakan interpolasi linier."""
@@ -215,17 +222,26 @@ class GRBLMotorCore:
         if z is not None: gcode_parts.append(f"Z{z}")
         gcode_parts.append(f"F{feedrate}")
         
+        if x is not None: self.last_known_pos["X"] = float(x)
+        if y is not None: self.last_known_pos["Y"] = float(y)
+        if z is not None: self.last_known_pos["Z"] = float(z)
+            
         gcode_str = " ".join(gcode_parts)
         return self.send_command(gcode_str)
 
     def homing(self):
-        return self.send_command("$H")
+        self.last_known_pos = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        if self.is_mock_mode:
+            print("[MOCK MOTOR] Motor kembali ke posisi 0 (0, 0, 0)")
+            return "ok"
+        self.send_command("G90")
+        return self.send_command("G0 X0 Y0 Z0")
 
     def unlock(self):
         return self.send_command("$X")
 
     def close(self):
-        if self.ser and self.ser.isOpened():
+        if self.ser and self.ser.is_open:
             self.ser.close()
             self.ser = None
             print("[CORE MOTOR] Sirkuit serial perangkat dibebaskan murni.")

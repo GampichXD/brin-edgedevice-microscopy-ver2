@@ -1451,7 +1451,8 @@ def extract_roi(image, roi_info, padding=5):
 
 if __name__ == '__main__':
     # ---- Change this to your tile folder ----------------
-    folder_path = "c:/path/to/your/tiles"
+    base_dir = Path(__file__).resolve().parent.parent
+    folder_path = base_dir / "Euglena_Tiles" / "7x7"
     # -----------------------------------------------------
 
     # Build SIFT extractor + LightGlue matcher (once)
