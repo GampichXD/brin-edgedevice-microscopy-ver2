@@ -1,0 +1,170 @@
+notes
+Add WEIGHTS_DIR to CONFIG in Both LG Files
+
+SuperPoint_LightGlue_Stitching.py == SP_LG.py
+SIFT_LightGlue_Stitching.py == SIFT_LG.py
+each weights is on .\Quantize_model\Weights\
+
+In SuperPoint_LightGlue_Stitching.py and SIFT_LightGlue_Stitching.py, add one key to CONFIG:
+
+python
+CONFIG = {
+    # --- General ---
+    'resize_factor':        1.0,
+    'overlap_percentage':   0.4,
+    'canvas_padding':       50,
+    'feather_distance':     30,
+    'normalization_method': 'skimage_histogram_match',
+
+    # --- Weights (local path — no internet required after setup) ---
+    'weights_dir': os.path.join(os.path.dirname(__file__), 'weights'),
+
+    # ... rest of CONFIG unchanged
+}
+
+Also add import os at the top of both files if it isn't already there.
+
+Step 3 — Modify build_extractor_matcher in Both Files
+
+The trick is clean and requires no modification to the LightGlue library itself. torch.hub.load_state_dict_from_url checks the cache directory before downloading — if the file is already there, it uses it and skips the download. So we redirect PyTorch's hub cache to your local weights/ folder before instantiation.
+
+For SuperPoint_LightGlue_Stitching.py — replace build_extractor_matcher:
+
+python
+def build_extractor_matcher(cfg=None):
+    """
+    Instantiate SuperPoint extractor and LightGlue matcher
+    using LOCAL pretrained weights (no internet required).
+
+    Weight files expected in cfg['weights_dir']:
+        superpoint_v1.pth
+        superpoint_lightglue_v0-1_arxiv.pth
+    """
+    cfg    = cfg or CONFIG
+    device = torch.device(cfg['device'])
+
+    weights_dir = cfg['weights_dir']
+
+    # Verify weight files exist before attempting to load
+    required = {
+        'superpoint_v1.pth':                  'SuperPoint detector',
+        'superpoint_lightglue_v0-1_arxiv.pth': 'LightGlue (superpoint) matcher',
+    }
+    for fname, label in required.items():
+        fpath = os.path.join(weights_dir, fname)
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(
+                f"[ERROR] {label} weights not found: {fpath}\n"
+                f"Run download_weights.py first to download all weights."
+            )
+
+    # Redirect torch.hub cache to our local weights folder.
+    # torch.hub.load_state_dict_from_url checks
+    # <hub_dir>/checkpoints/<filename> before downloading.
+    # Setting hub dir to weights_dir makes it look there directly.
+    original_hub_dir = torch.hub.get_dir()
+    torch.hub.set_dir(weights_dir)
+
+    # Create the checkpoints subfolder symlink that torch.hub expects
+    checkpoints_dir = os.path.join(weights_dir, 'checkpoints')
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    # Symlink weight files into the checkpoints subfolder if not already there
+    for fname in required:
+        src  = os.path.join(weights_dir, fname)
+        link = os.path.join(checkpoints_dir, fname)
+        if not os.path.exists(link):
+            os.symlink(src, link)
+
+    try:
+        extractor = (
+            SuperPoint(max_num_keypoints=cfg['sp_max_keypoints'],
+                       detection_threshold=cfg['sp_detection_threshold'])
+            .eval()
+            .to(device)
+        )
+        matcher = (
+            LightGlue(features='superpoint',
+                      depth_confidence=cfg['lg_depth_confidence'],
+                      width_confidence=cfg['lg_width_confidence'],
+                      filter_threshold=cfg['lg_filter_threshold'])
+            .eval()
+            .to(device)
+        )
+    finally:
+        # Always restore original hub dir, even if loading fails
+        torch.hub.set_dir(original_hub_dir)
+
+    print(f"[INFO] SuperPoint loaded from: {os.path.join(weights_dir, 'superpoint_v1.pth')}")
+    print(f"[INFO] LightGlue (SP) loaded from: "
+          f"{os.path.join(weights_dir, 'superpoint_lightglue_v0-1_arxiv.pth')}")
+    print(f"[INFO] Device: {device}")
+    return extractor, matcher, device
+
+For SIFT_LightGlue_Stitching.py — replace build_extractor_matcher:
+
+python
+def build_extractor_matcher(cfg=None):
+    """
+    Instantiate LightGlue SIFT extractor and LightGlue matcher
+    using LOCAL pretrained weights (no internet required).
+
+    Weight files expected in cfg['weights_dir']:
+        sift_lightglue_v0-1_arxiv.pth
+    (SIFT detection itself uses OpenCV — no weights needed for the extractor.)
+    """
+    cfg    = cfg or CONFIG
+    device = torch.device(cfg['device'])
+
+    weights_dir = cfg['weights_dir']
+
+    # Only LightGlue needs weights — SIFT uses OpenCV internally
+    required = {
+        'sift_lightglue_v0-1_arxiv.pth': 'LightGlue (sift) matcher',
+    }
+    for fname, label in required.items():
+        fpath = os.path.join(weights_dir, fname)
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(
+                f"[ERROR] {label} weights not found: {fpath}\n"
+                f"Run download_weights.py first to download all weights."
+            )
+
+    original_hub_dir = torch.hub.get_dir()
+    torch.hub.set_dir(weights_dir)
+
+    checkpoints_dir = os.path.join(weights_dir, 'checkpoints')
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    for fname in required:
+        src  = os.path.join(weights_dir, fname)
+        link = os.path.join(checkpoints_dir, fname)
+        if not os.path.exists(link):
+            os.symlink(src, link)
+
+    try:
+        extractor = (
+            SIFT(max_num_keypoints=cfg['sift_max_keypoints'],
+                 peak_threshold=cfg['sift_peak_threshold'],
+                 edge_threshold=cfg['sift_edge_threshold'])
+            .eval()
+            .to(device)
+        )
+        matcher = (
+            LightGlue(features='sift',
+                      depth_confidence=cfg['lg_depth_confidence'],
+                      width_confidence=cfg['lg_width_confidence'],
+                      filter_threshold=cfg['lg_filter_threshold'])
+            .eval()
+            .to(device)
+        )
+    finally:
+        torch.hub.set_dir(original_hub_dir)
+
+    print(f"[INFO] SIFT extractor ready (OpenCV, no weights needed)")
+    print(f"[INFO] LightGlue (SIFT) loaded from: "
+          f"{os.path.join(weights_dir, 'sift_lightglue_v0-1_arxiv.pth')}")
+    print(f"[INFO] Device: {device}")
+    return extractor, matcher, device
+Why Symlinks, Not Copies
+
+torch.hub.load_state_dict_from_url looks for the file in <hub_dir>/checkpoints/<filename>. Rather than duplicating the weight files (wasting ~95 MB), a symlink inside checkpoints/ points back to the actual file in weights/. The weight files live in one place, the symlink is just a pointer. On Windows (where symlinks may need admin rights), replace os.symlink with shutil.copy2 — it wastes the disk space but is simpler.
