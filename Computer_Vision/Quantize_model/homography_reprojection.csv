@@ -1,0 +1,2 @@
+tile1_coord,tile2_coord,match_count,inliers,mean_error,median_error,min_error,max_error
+"(1.0,0.0)","(0.0,0.0)",2007,2007,0.019,0.013,0.0,1.596

@@ -11,8 +11,98 @@ from collections import defaultdict, deque
 from skimage.metrics import structural_similarity as ssim
 from skimage.exposure import match_histograms
 
+# Installation:  pip install -r requirements_BFMatcher.txt
+# Full guide:    see INSTALL.md in this directory
+
 warnings.filterwarnings('ignore')
 cv2.ocl.setUseOpenCL(False)
+
+import time
+import resource
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+
+# ============================================================
+# PERFORMANCE & MEMORY TRACKER HELPER
+# ============================================================
+class PerformanceTracker:
+    """
+    Tracks runtime duration and memory consumption (RAM & GPU VRAM).
+    """
+    def __init__(self, name="Pipeline Benchmark"):
+        self.name = name
+        self.start_time = time.time()
+        self.last_step_time = self.start_time
+        self.step_times = {}
+
+        # Reset GPU peak stats if available
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+    def record_step(self, step_name):
+        now = time.time()
+        elapsed = now - self.last_step_time
+        self.step_times[step_name] = elapsed
+        self.last_step_time = now
+
+    def _get_ram_usage(self):
+        current_ram_mb = 0.0
+        if HAS_PSUTIL:
+            try:
+                process = psutil.Process(os.getpid())
+                current_ram_mb = process.memory_info().rss / (1024 * 1024)
+            except Exception:
+                pass
+        peak_ram_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        return current_ram_mb, peak_ram_mb
+
+    def _get_gpu_usage(self):
+        current_gpu_mb = 0.0
+        peak_gpu_mb = 0.0
+        try:
+            import torch
+            if torch.cuda.is_available():
+                current_gpu_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                peak_gpu_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        except Exception:
+            pass
+        return current_gpu_mb, peak_gpu_mb
+
+    def print_summary(self):
+        total_time = time.time() - self.start_time
+        curr_ram, peak_ram = self._get_ram_usage()
+        curr_gpu, peak_gpu = self._get_gpu_usage()
+
+        print("\n" + "=" * 65)
+        print(f"  PERFORMANCE & MEMORY BENCHMARK: {self.name}")
+        print("=" * 65)
+        print(f"  Total Execution Time : {total_time:.3f} seconds ({total_time / 60:.2f} min)")
+        print("-" * 65)
+        print("  Execution Time Breakdown:")
+        for step, duration in self.step_times.items():
+            pct = (duration / total_time * 100) if total_time > 0 else 0.0
+            print(f"    - {step:<38}: {duration:8.3f} s ({pct:5.1f}%)")
+        print("-" * 65)
+        print("  Memory Consumption:")
+        if curr_ram > 0:
+            print(f"    - Current RAM (RSS)   : {curr_ram:.2f} MB")
+        print(f"    - Peak RAM (RSS)      : {peak_ram:.2f} MB ({peak_ram / 1024:.2f} GB)")
+        if peak_gpu > 0 or curr_gpu > 0:
+            print(f"    - Current GPU VRAM    : {curr_gpu:.2f} MB")
+            print(f"    - Peak GPU VRAM       : {peak_gpu:.2f} MB ({peak_gpu / 1024:.2f} GB)")
+        else:
+            print("    - GPU VRAM            : N/A (Running on CPU)")
+        print("=" * 65 + "\n")
+
 # ============================================================
 # CONFIGURATION — stop scattering magic numbers everywhere
 # ============================================================
@@ -29,6 +119,8 @@ CONFIG = {
     'display_feather_distance':  30,  # soft feather for human viewing
     'analysis_feather_distance': 0,   # hard seam for analysis/training copy
     'feather_distance': 30,           # legacy alias -- used by blend_panorama
+    'peak_threshold': 0.01,
+    'edge_threshold': 10
 }
 
 VALID_METHODS = ('sift', 'akaze', 'orb', 'brisk')
@@ -151,8 +243,13 @@ def select_descriptor(image, method='sift'):
 
     # NOTE: Only ONE SIFT_create call; parameters are actually kept now.
     if method == 'sift':
-        detector = cv2.SIFT_create(nfeatures=4096, contrastThreshold=0.02,
-                                   edgeThreshold=10, sigma=1.6)
+        # Fetch config values into local variables to simplify the expression
+        # This can sometimes resolve unexpected NameErrors if the interpreter
+        # has issues resolving dictionary keys in certain contexts.
+        sift_peak_threshold = CONFIG['peak_threshold']
+        sift_edge_threshold = CONFIG['edge_threshold']
+        detector = cv2.SIFT_create(nfeatures=4096, contrastThreshold=sift_peak_threshold,
+                                   edgeThreshold=sift_edge_threshold, sigma=1.6)
     elif method == 'akaze':
         detector = cv2.AKAZE_create(threshold=0.00005)
     elif method == 'orb':
@@ -1110,27 +1207,33 @@ def visualize_blending_debug(debug_info, final_image):
 # ============================================================
 
 if __name__ == '__main__':
-    base_dir = Path(__file__).resolve().parent.parent
-    folder_path = base_dir / "Euglena_Tiles" / "7x7"
+    folder_path = "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/1x2"   # ← change this
+
+    # Initialize Performance & Memory Tracker
+    tracker = PerformanceTracker(f"SIFT + BFMatcher Pipeline ({CONFIG['feature_method'].upper()})")
 
     # Step 1
     image_data, grid_info = load_image(folder_path, CONFIG['resize_factor'])
     fig = visualize_grid_preview(image_data, grid_info)
     plt.show()
+    tracker.record_step("1. Image Loading & Grid Preview")
 
     # Step 2
     overlap_pairs    = calculate_overlap(image_data, grid_info, CONFIG['overlap_percentage'])
     visualize_overlap_regions(image_data, overlap_pairs, grid_info)
     plt.show()
     overlap_features = extract_overlap_features(image_data, overlap_pairs, CONFIG['feature_method'])
+    tracker.record_step("2. Overlap Region & Feature Extraction")
 
     # Step 3
     match_result = match_overlap_features(overlap_features, CONFIG['feature_method'], CONFIG['lowe_ratio'])
+    tracker.record_step("3. BFMatcher Feature Matching")
 
     # Step 4
     homography_results = calculate_homographies_batch(image_data, match_result, CONFIG['reproj_thresh'])
     evaluate_homography_reprojection(match_result, homography_results,
                                      output_csv="homography_reprojection.csv")
+    tracker.record_step("4. Homography RANSAC & Reprojection Report")
 
     # Step 4.5 — evaluate BEFORE stitching, using homography results
     transforms, reference, reachable_images = calculate_all_transforms(image_data, homography_results)
@@ -1142,6 +1245,7 @@ if __name__ == '__main__':
         output_csv="overlap_metrics.csv",
         visualize_sample=False,
     )
+    tracker.record_step("4.5 Overlap Quality Metrics Evaluation")
 
     # Step 5 — blend
     blended, debug_info = blend_panorama(
@@ -1159,6 +1263,10 @@ if __name__ == '__main__':
     save_path = str(Path(folder_path) / "result_final_SIFTBf.jpg")
     cv2.imwrite(save_path, cv2.cvtColor(final_result, cv2.COLOR_RGB2BGR))
     print(f"✅ Saved: {save_path}")
+    tracker.record_step("5. Feather Blending, ROI Crop & Saving")
+
+    # Output Benchmark Summary Report
+    tracker.print_summary()
 
     plt.figure(figsize=(20, 10))
     plt.imshow(final_result)

@@ -52,10 +52,115 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.exposure import match_histograms
 
 from lightglue import LightGlue, SuperPoint
+from lightglue import LightGlue, SuperPoint
 from lightglue.utils import rbd   # remove_batch_dim helper
 
 warnings.filterwarnings('ignore')
 cv2.ocl.setUseOpenCL(False)
+
+import time
+try:
+    import resource
+except ImportError:
+    resource = None
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+
+# ============================================================
+# PERFORMANCE & MEMORY TRACKER HELPER
+# ============================================================
+class PerformanceTracker:
+    """
+    Tracks runtime duration and memory consumption (RAM & GPU VRAM).
+    """
+    def __init__(self, name="Pipeline Benchmark"):
+        self.name = name
+        self.start_time = time.time()
+        self.last_step_time = self.start_time
+        self.step_times = {}
+
+        # Reset GPU peak stats if available
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+    def record_step(self, step_name):
+        now = time.time()
+        elapsed = now - self.last_step_time
+        self.step_times[step_name] = elapsed
+        self.last_step_time = now
+
+    def _get_ram_usage(self):
+        current_ram_mb = 0.0
+        if HAS_PSUTIL:
+            try:
+                process = psutil.Process(os.getpid())
+                current_ram_mb = process.memory_info().rss / (1024 * 1024)
+            except Exception:
+                pass
+        
+        if resource is not None:
+            peak_ram_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        else:
+            if HAS_PSUTIL:
+                try:
+                    process = psutil.Process(os.getpid())
+                    peak_ram_mb = getattr(process.memory_info(), 'peak_wset', 0.0) / (1024 * 1024)
+                except Exception:
+                    peak_ram_mb = 0.0
+            else:
+                peak_ram_mb = 0.0
+        return current_ram_mb, peak_ram_mb
+
+    def _get_gpu_usage(self):
+        current_gpu_mb = 0.0
+        peak_gpu_mb = 0.0
+        try:
+            import torch
+            if torch.cuda.is_available():
+                current_gpu_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                peak_gpu_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        except Exception:
+            pass
+        return current_gpu_mb, peak_gpu_mb
+
+    def print_summary(self):
+        total_time = time.time() - self.start_time
+        curr_ram, peak_ram = self._get_ram_usage()
+        curr_gpu, peak_gpu = self._get_gpu_usage()
+
+        print("\n" + "=" * 65)
+        print(f"  PERFORMANCE & MEMORY BENCHMARK: {self.name}")
+        print("=" * 65)
+        print(f"  Total Execution Time : {total_time:.3f} seconds ({total_time / 60:.2f} min)")
+        print("-" * 65)
+        print("  Hardware Acceleration:")
+        print(f"    - SuperPoint Device    : GPU (SuperPoint via PyTorch)")
+        print(f"    - Matcher Device       : GPU (LightGlue via PyTorch)")
+        print("-" * 65)
+        print("  Execution Time Breakdown:")
+        for step, duration in self.step_times.items():
+            pct = (duration / total_time * 100) if total_time > 0 else 0.0
+            print(f"    - {step:<38}: {duration:8.3f} s ({pct:5.1f}%)")
+        print("-" * 65)
+        print("  Memory Consumption:")
+        if curr_ram > 0:
+            print(f"    - Current RAM (RSS)   : {curr_ram:.2f} MB")
+        print(f"    - Peak RAM (RSS)      : {peak_ram:.2f} MB ({peak_ram / 1024:.2f} GB)")
+        if peak_gpu > 0 or curr_gpu > 0:
+            print(f"    - Current GPU VRAM    : {curr_gpu:.2f} MB")
+            print(f"    - Peak GPU VRAM       : {peak_gpu:.2f} MB ({peak_gpu / 1024:.2f} GB)")
+        else:
+            print("    - GPU VRAM            : N/A (Running on CPU)")
+        print("=" * 65 + "\n")
 
 
 # ============================================================
@@ -75,14 +180,13 @@ CONFIG = {
     'weights_dir': os.path.join(os.path.dirname(__file__), 'weights'),
 
     # --- SuperPoint extractor ---
-    'sp_max_keypoints':       4096,   # keypoints per ROI; -1 = unlimited
+    'sp_max_keypoints':       1024,   # keypoints per ROI; -1 = unlimited (reduced for edge devices)
     'sp_detection_threshold': 0.005,  # lower → more keypoints detected
 
     # --- LightGlue matcher ---
-    # Bug fix: set both to -1 to disable early-exit during benchmarking so
-    # LightGlue runs at full capacity.  Re-enable (0.95 / 0.99) for deployment.
-    'lg_depth_confidence': -1,     # early-exit confidence (0-1; -1 = off)
-    'lg_width_confidence': -1,     # pruning confidence   (0-1; -1 = off)
+    # Re-enabled (0.95 / 0.99) adaptive depth pruning and early-exit for edge deployment on Orin Nano.
+    'lg_depth_confidence': 0.95,     # early-exit confidence (0-1; -1 = off)
+    'lg_width_confidence': 0.99,     # pruning confidence   (0-1; -1 = off)
     'lg_filter_threshold': 0.1,    # match score threshold
 
     # --- RANSAC / homography ---
@@ -91,6 +195,9 @@ CONFIG = {
 
     # --- Device ---
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'debug': False,                 # Gate visualization plotting to avoid headless display hangs
+    'evaluate_metrics': False,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
+    'enable_benchmark': True,       # Toggle Performance & Memory Tracker benchmarking
 }
 
 
@@ -1480,66 +1587,92 @@ def extract_roi(image, roi_info, padding=5):
 
 if __name__ == '__main__':
     # ---- Change this to your tile folder ----------------
-    folder_path = "c:/path/to/your/tiles"
+    folder_path = "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/3x3"   # ← change this" 
     # -----------------------------------------------------
+
+    # Initialize Performance & Memory Tracker
+    tracker = None
+    if CONFIG.get('enable_benchmark', True):
+        tracker = PerformanceTracker("SuperPoint + LightGlue Pipeline (SP_LG)")
 
     # Build SuperPoint extractor + LightGlue matcher (once)
     extractor, matcher, device = build_extractor_matcher(CONFIG)
+    if tracker:
+        tracker.record_step("0. Model Loading & Initialization")
 
     # Step 1 -- Load images & build grid
     image_data, grid_info = load_image(folder_path, CONFIG['resize_factor'])
-    visualize_grid_preview(image_data, grid_info)
-    plt.show()
+    if CONFIG.get('debug', False):
+        visualize_grid_preview(image_data, grid_info)
+        plt.show()
+    if tracker:
+        tracker.record_step("1. Image Loading & Grid Preview")
 
     # Step 2 -- Compute overlap zones
     overlap_pairs = calculate_overlap(image_data, grid_info,
                                       CONFIG['overlap_percentage'])
-    visualize_overlap_regions(image_data, overlap_pairs, grid_info)
-    plt.show()
+    if CONFIG.get('debug', False):
+        visualize_overlap_regions(image_data, overlap_pairs, grid_info)
+        plt.show()
+    if tracker:
+        tracker.record_step("2. Overlap Region Setup")
 
     # Step 3 -- SuperPoint extraction on each ROI
     overlap_features = extract_overlap_features(
         image_data, overlap_pairs, extractor, device)
-    visualize_overlap_features(image_data, overlap_features, grid_info)
-    plt.show()
+    if CONFIG.get('debug', False):
+        visualize_overlap_features(image_data, overlap_features, grid_info)
+        plt.show()
+    if tracker:
+        tracker.record_step("3. SuperPoint Feature Extraction")
 
     # Step 4 -- LightGlue matching (superpoint mode)
     match_result = match_overlap_features(
         overlap_features, image_data, matcher, device)
+    if tracker:
+        tracker.record_step("4. LightGlue Feature Matching")
 
     # Optional: visualize top/worst match pairs
-    viz = visualize_lightglue_matches(image_data, match_result, top_n=3)
-    if viz:
-        plt.show()
+    if CONFIG.get('debug', False):
+        viz = visualize_lightglue_matches(image_data, match_result, top_n=3)
+        if viz:
+            plt.show()
 
     # Step 5 -- Homography via RANSAC
     homography_results = calculate_homographies_batch(
         image_data, match_result, CONFIG['reproj_thresh'])
+    if tracker:
+        tracker.record_step("5. Homography RANSAC")
 
     # Step 5.1 -- Reprojection error report
-    evaluate_homography_reprojection(match_result, homography_results,
-                                     output_csv="homography_reprojection_sp_lg.csv")
+    if CONFIG.get('evaluate_metrics', False):
+        evaluate_homography_reprojection(match_result, homography_results,
+                                         output_csv="homography_reprojection_sp_lg.csv")
 
     # Step 5.5 -- Overlap quality metrics (PSNR, SSIM, RMSE, NCC)
     transforms, reference, reachable_images = calculate_all_transforms(
         image_data, homography_results)
     canvas_w, canvas_h, offset_x, offset_y = calculate_optimal_canvas(
         image_data, transforms)
-    evaluate_overlap_metrics(
-        image_data, transforms, reachable_images,
-        canvas_w, canvas_h, offset_x, offset_y,
-        homography_results=homography_results,   # adjacent-only -- O(N) not O(N²)
-        output_csv="overlap_metrics_sp_lg.csv",
-        visualize_sample=False,
-    )
+    if CONFIG.get('evaluate_metrics', False):
+        evaluate_overlap_metrics(
+            image_data, transforms, reachable_images,
+            canvas_w, canvas_h, offset_x, offset_y,
+            homography_results=homography_results,   # adjacent-only -- O(N) not O(N²)
+            output_csv="overlap_metrics_sp_lg.csv",
+            visualize_sample=False,
+        )
+    if tracker and CONFIG.get('evaluate_metrics', False):
+        tracker.record_step("5.5 Overlap Quality Metrics Evaluation")
 
     # Step 6 -- Feather blending
     blended, debug_info = blend_panorama(
         image_data, transforms, reachable_images,
         canvas_w, canvas_h, offset_x, offset_y,
     )
-    visualize_blending_debug(debug_info, blended)
-    plt.show()
+    if CONFIG.get('debug', False):
+        visualize_blending_debug(debug_info, blended)
+        plt.show()
 
     # ROI crop -- remove black borders
     roi_info     = find_roi(blended, min_threshold=1, debug=True)
@@ -1549,9 +1682,16 @@ if __name__ == '__main__':
     save_path = str(Path(folder_path) / "result_sp_lg.jpg")
     cv2.imwrite(save_path, cv2.cvtColor(final_result, cv2.COLOR_RGB2BGR))
     print(f"Saved: {save_path}")
+    if tracker:
+        tracker.record_step("6. Feather Blending, ROI Crop & Saving")
 
-    plt.figure(figsize=(20, 10))
-    plt.imshow(final_result)
-    plt.axis('off')
-    plt.title('SuperPoint + LightGlue Tile Stitching Result', fontsize=16)
-    plt.show()
+    # Output Benchmark Summary Report
+    if tracker:
+        tracker.print_summary()
+
+    if CONFIG.get('debug', False):
+        plt.figure(figsize=(20, 10))
+        plt.imshow(final_result)
+        plt.axis('off')
+        plt.title('SuperPoint + LightGlue Tile Stitching Result', fontsize=16)
+        plt.show()

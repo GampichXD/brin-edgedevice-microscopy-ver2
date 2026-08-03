@@ -1,0 +1,2 @@
+tile1_coord,tile2_coord,overlap_pixels,overlap_width,overlap_height,psnr,ssim,rmse,ncc
+"(1.0,0.0)","(0.0,0.0)",1176167,613,1920,33.416,0.9835,5.442,0.9892
