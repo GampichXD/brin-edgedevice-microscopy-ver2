@@ -31,7 +31,7 @@ def sync_datasets():
             continue
             
         # Temukan semua file media (gambar dan video) di dalam folder ini
-        media_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.mp4'))]
+        media_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.mp4', '.webm'))]
         
         for file_name in media_files:
             # Skip file sementara (sedang direkam) dan file 0-byte
@@ -51,7 +51,7 @@ def sync_datasets():
                 
                 try:
                     with open(file_path, 'rb') as f:
-                        mime_type = 'video/mp4' if file_name.lower().endswith('.mp4') else 'image/jpeg'
+                        mime_type = 'video/webm' if file_name.lower().endswith('.webm') else ('video/mp4' if file_name.lower().endswith('.mp4') else 'image/jpeg')
                         files = {'files': (file_name, f, mime_type)}
                         response = requests.post(sync_url, files=files, timeout=30)
                         

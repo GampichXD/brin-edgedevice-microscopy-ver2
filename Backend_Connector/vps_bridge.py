@@ -18,9 +18,13 @@ from Hardware.Computer_Vision.classic_cv_edit import classic_cv_editor
 
 # Konfigurasi Koneksi VPS & Direktori Edge
 VPS_WS_URL = os.getenv("VPS_WS_URL", "ws://127.0.0.1:8000/api/hardware/ws")
-LOCAL_TMP_DIR = "./tmp_images"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_TMP_DIR = os.path.join(BASE_DIR, "tmp_images")
 if not os.path.exists(LOCAL_TMP_DIR):
     os.makedirs(LOCAL_TMP_DIR)
+
+# Global lock to prevent websocket send collisions between video stream and large image payloads
+ws_lock = asyncio.Lock()
 
 # State global
 is_streaming = False
@@ -100,29 +104,32 @@ async def receive_handler(websocket):
                 print(f"[BRIDGE] Eksekusi G-Code: {gcode}")
                 grbl_resp = motor_core.jog_from_gcode(gcode)
                 
-                await websocket.send(json.dumps({
-                    "event": "MOTOR_MOVED",
-                    "status": "SUCCESS",
-                    "grbl_response": grbl_resp
-                }))
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "MOTOR_MOVED",
+                        "status": "SUCCESS",
+                        "grbl_response": grbl_resp
+                    }))
 
             elif action == "HOMING":
                 print("[BRIDGE] Perintah VPS: Homing motor.")
                 grbl_resp = motor_core.homing()
-                await websocket.send(json.dumps({
-                    "event": "MOTOR_MOVED",
-                    "status": "SUCCESS",
-                    "grbl_response": grbl_resp
-                }))
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "MOTOR_MOVED",
+                        "status": "SUCCESS",
+                        "grbl_response": grbl_resp
+                    }))
 
             elif action == "UNLOCK":
                 print("[BRIDGE] Perintah VPS: Unlock motor.")
                 grbl_resp = motor_core.unlock()
-                await websocket.send(json.dumps({
-                    "event": "MOTOR_MOVED",
-                    "status": "SUCCESS",
-                    "grbl_response": grbl_resp
-                }))
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "MOTOR_MOVED",
+                        "status": "SUCCESS",
+                        "grbl_response": grbl_resp
+                    }))
 
             elif action == "APPLY_CAMERA_SETTINGS":
                 print(
@@ -164,7 +171,7 @@ async def receive_handler(websocket):
                     rec_dir = os.path.abspath(os.path.join(".", "local_datasets", folder_id))
                     if not os.path.exists(rec_dir):
                         os.makedirs(rec_dir)
-                    filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+                    filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.webm"
                     recording_final_filepath = os.path.join(rec_dir, filename)
                     recording_filepath = os.path.join(rec_dir, f"_temp_{filename}")
                     # Use mp4v codec for MP4 so it plays natively in web browsers
@@ -195,33 +202,51 @@ async def receive_handler(websocket):
                     print("[BRIDGE] Perekaman video dihentikan.")
 
             elif action == "CAPTURE_IMAGE":
-                filename = data.get("filename", "IMG_0000.jpg")
-                img_path = os.path.join(LOCAL_TMP_DIR, filename)
-                print(f"[BRIDGE CAMERA] Menangkap gambar resolusi tinggi: {filename}")
+                prefix = data.get("prefix", "IMG_MANUAL")
+                cx = data.get("x", 0.0)
+                cy = data.get("y", 0.0)
+                requested_filename = data.get("filename")
+                print(f"[BRIDGE] 📸 Mengambil foto manual dari frontend (prefix={prefix}, X={cx}, Y={cy})...")
                 
-                # Menangkap frame kualitas maksimum dari sensor Edge secara sinkron
-                frame_bytes = camera_core.capture_to_bytes(quality=100)
-                if not frame_bytes or len(frame_bytes) == 0:
-                    print(f"[BRIDGE CAMERA WARNING] Kamera fisik offline. Membangkitkan gambar mockup {filename}...")
+                # Biarkan camera_core yang menentukan nama final dan menyimpannya (jika berhasil hardware)
+                filename = camera_core.save_snapshot(LOCAL_TMP_DIR, prefix=prefix, coord_x=cx, coord_y=cy, requested_filename=requested_filename)
+                
+                if filename:
+                    # Sync ditangani oleh block di bawah melalui websocket
+                    file_path = os.path.join(LOCAL_TMP_DIR, filename)
+                    print(f"[BRIDGE CAMERA] Tersimpan: {file_path}")
+                else:
+                    print(f"[BRIDGE CAMERA WARNING] Kamera fisik offline. Membangkitkan gambar mockup...")
                     import numpy as np
+                    import random
+                    
+                    # Buat mockup
+                    if requested_filename:
+                        filename = requested_filename
+                    else:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"{prefix}_{timestamp}_X{str(cx).replace('.','_')}_Y{str(cy).replace('.','_')}.jpg"
+                        
+                    img_path = os.path.join(LOCAL_TMP_DIR, filename)
                     mock_img = np.zeros((480, 640, 3), dtype=np.uint8)
-                    mock_img[:] = (50, 50, 150) # warna latar biru
+                    mock_img[:] = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200)) # warna latar acak
                     cv2.putText(mock_img, f"MOCK {filename}", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
                     cv2.imwrite(img_path, mock_img)
-                    with open(img_path, "rb") as f:
-                        frame_bytes = f.read()
-                else:
-                    with open(img_path, "wb") as f:
-                        f.write(frame_bytes)
-                    print(f"[BRIDGE CAMERA] Tersimpan: {img_path}")
+                    print(f"[BRIDGE CAMERA] MOCK Tersimpan: {img_path}")
                 
                 # UPLOAD KE VPS SUPAYA BISA DILIHAT DI BROWSER
-                encoded_image = base64.b64encode(frame_bytes).decode('utf-8')
-                await websocket.send(json.dumps({
-                    "event": "IMAGE_CAPTURED",
-                    "filename": filename,
-                    "image_data": f"data:image/jpeg;base64,{encoded_image}"
-                }))
+                try:
+                    with open(os.path.join(LOCAL_TMP_DIR, filename), "rb") as f:
+                        frame_bytes = f.read()
+                    encoded_image = base64.b64encode(frame_bytes).decode('utf-8')
+                    async with ws_lock:
+                        await websocket.send(json.dumps({
+                            "event": "IMAGE_CAPTURED",
+                            "filename": filename,
+                            "image_data": f"data:image/jpeg;base64,{encoded_image}"
+                        }))
+                except Exception as e:
+                    print(f"[BRIDGE ERROR] Gagal mengirim base64 image ke websocket: {e}")
 
             elif action == "START_STITCHING":
                 print("[BRIDGE AI] Menjalankan Deep Learning Tile Stitching...")
@@ -244,14 +269,17 @@ async def receive_handler(websocket):
                     with open(output_file, "rb") as img_file:
                         encoded_stitched = base64.b64encode(img_file.read()).decode('utf-8')
 
-                    await websocket.send(json.dumps({
-                        "event": "STITCHING_COMPLETE",
-                        "status": "SUCCESS",
-                        "image_data": f"data:image/jpeg;base64,{encoded_stitched}",
-                        "filename": "stitched_ta_output.jpg"
-                    }))
+                    async with ws_lock:
+                        await websocket.send(json.dumps({
+                            "event": "STITCHING_COMPLETE",
+                            "status": "SUCCESS",
+                            "image_data": f"data:image/jpeg;base64,{encoded_stitched}",
+                            "filename": "stitched_ta_output.jpg"
+                        }))
                 else:
-                    await websocket.send(json.dumps({"event": "STITCHING_FAILED", "status": "ERROR"}))
+                    print("[BRIDGE ERROR] Stitching gagal.")
+                    async with ws_lock:
+                        await websocket.send(json.dumps({"event": "STITCHING_FAILED", "status": "ERROR"}))
 
             elif action == "START_DL_COUNT":
                 print("[BRIDGE AI] Menjalankan Deep Learning Colony Counter (YOLO)...")
@@ -265,13 +293,14 @@ async def receive_handler(websocket):
                 with open(local_predicted_path, "rb") as img_file:
                     encoded_predicted = base64.b64encode(img_file.read()).decode('utf-8')
 
-                await websocket.send(json.dumps({
-                    "event": "COUNTING_COMPLETE",
-                    "status": "SUCCESS",
-                    "total_cells": count_result,
-                    "image_data": f"data:image/jpeg;base64,{encoded_predicted}",
-                    "filename": result_img
-                }))
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "COUNTING_COMPLETE",
+                        "status": "SUCCESS",
+                        "total_cells": count_result,
+                        "image_data": f"data:image/jpeg;base64,{encoded_predicted}",
+                        "filename": result_img
+                    }))
 
             elif action == "APPLY_IMAGE_EDIT":
                 edit_type = data.get("type", "")
@@ -289,96 +318,135 @@ async def receive_handler(websocket):
                 with open(local_edited_path, "rb") as img_file:
                     encoded_edited = base64.b64encode(img_file.read()).decode('utf-8')
 
-                await websocket.send(json.dumps({
-                    "event": "EDIT_COMPLETE",
-                    "status": "SUCCESS",
-                    "image_data": f"data:image/jpeg;base64,{encoded_edited}",
-                    "filename": res_file
-                }))
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "EDIT_COMPLETE",
+                        "status": "SUCCESS",
+                        "image_data": f"data:image/jpeg;base64,{encoded_edited}",
+                        "filename": res_file
+                    }))
             
             elif action == "CV_COLONY_COUNT":
                 filename = data.get("filename")
-                print(f"[BRIDGE AI] Analysis API: YOLO Colony Counter on {filename}")
+                print("\n" + "="*60)
+                print(f"[BRIDGE AI] 🧬 FITUR AKTIF: YOLO Colony Counter")
+                print(f"[BRIDGE AI] ⏳ Memuat bobot neural network YOLO...")
+                print(f"[BRIDGE AI] 🔍 Menganalisis citra: {filename}")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     result_img, count_result = colony_counter.analyze_image(input_path)
                     json_output = os.path.join("../Software/backend/static/uploads", result_img.replace('.jpg', '.json').replace('.png', '.json'))
                     with open(json_output, 'w') as f:
                         json.dump({"colony_count": count_result}, f)
-                    print(f"[BRIDGE AI] Selesai. Hasil: {count_result} koloni.")
+                    print(f"[BRIDGE AI] ✅ Selesai. Hasil deteksi: {count_result} koloni.")
+                    print("="*60 + "\n")
 
             elif action == "CV_THRESHOLD":
                 filename = data.get("filename")
-                print(f"[BRIDGE CV] Analysis API: Adaptive Threshold on {filename}")
+                print("\n" + "-"*50)
+                print(f"[BRIDGE CV] 🌗 FITUR AKTIF: Adaptive Threshold")
+                print(f"[BRIDGE CV] 🧮 Menghitung nilai biner pada {filename}...")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     res_file = classic_cv_editor.apply_adaptive_threshold(input_path)
-                    print(f"[BRIDGE CV] Selesai. Output: {res_file}")
+                    print(f"[BRIDGE CV] ✅ Binarisasi Selesai. Output: {res_file}")
+                    print("-" * 50 + "\n")
                 else:
                     print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
 
             elif action == "CV_CONTOUR":
                 filename = data.get("filename")
-                print(f"[BRIDGE CV] Analysis API: Ekstraksi Kontur on {filename}")
+                print("\n" + "-"*50)
+                print(f"[BRIDGE CV] 🦠 FITUR AKTIF: Ekstraksi Kontur")
+                print(f"[BRIDGE CV] 📐 Mencari dinding sel geometri pada {filename}...")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     res_file = classic_cv_editor.extract_and_draw_contours(input_path)
-                    print(f"[BRIDGE CV] Selesai. Output: {res_file}")
+                    print(f"[BRIDGE CV] ✅ Penggambaran Kontur Selesai. Output: {res_file}")
+                    print("-" * 50 + "\n")
                 else:
                     print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
 
             elif action == "CV_MORPHOLOGY":
                 filename = data.get("filename")
-                print(f"[BRIDGE CV] Analysis API: Kalkulasi Morfologi on {filename}")
+                print("\n" + "-"*50)
+                print(f"[BRIDGE CV] 📏 FITUR AKTIF: Kalkulasi Morfologi")
+                print(f"[BRIDGE CV] 📊 Mengekstrak area dan keliling dari {filename}...")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     res_file, stats = classic_cv_editor.calculate_morphology(input_path)
                     json_output = os.path.join("../Software/backend/static/uploads", res_file.replace('.jpg', '.json').replace('.png', '.json'))
                     with open(json_output, 'w') as f:
                         json.dump(stats, f)
-                    print(f"[BRIDGE CV] Selesai. Output: {res_file}")
+                    print(f"[BRIDGE CV] ✅ Kalkulasi Morfologi Selesai. Output: {res_file}")
+                    print("-" * 50 + "\n")
                 else:
                     print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
 
             elif action == "CV_SOBEL":
                 filename = data.get("filename")
-                print(f"[BRIDGE CV] Analysis API: Sobel Edge Detection on {filename}")
+                print("\n" + "-"*50)
+                print(f"[BRIDGE CV] 🔪 FITUR AKTIF: Sobel Edge Detection")
+                print(f"[BRIDGE CV] 🧮 Mengekstrak garis tepi konvolusi pada {filename}...")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     res_file = classic_cv_editor.apply_sobel_edge(input_path)
-                    print(f"[BRIDGE CV] Selesai. Output: {res_file}")
+                    print(f"[BRIDGE CV] ✅ Deteksi Tepi Selesai. Output: {res_file}")
+                    print("-" * 50 + "\n")
                 else:
                     print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
 
             elif action == "CV_ROI":
                 filename = data.get("filename")
-                print(f"[BRIDGE CV] Analysis API: ROI Selection on {filename}")
+                print("\n" + "-"*50)
+                print(f"[BRIDGE CV] ✂️ FITUR AKTIF: ROI Selection")
+                print(f"[BRIDGE CV] 📍 Memotong area spesifik citra {filename}...")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     res_file = classic_cv_editor.auto_roi_crop(input_path)
-                    print(f"[BRIDGE CV] Selesai. Output: {res_file}")
+                    print(f"[BRIDGE CV] ✅ Pemotongan Selesai. Output: {res_file}")
+                    print("-" * 50 + "\n")
                 else:
                     print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
 
             elif action == "CV_CALIBRATE":
                 filename = data.get("filename")
-                print(f"[BRIDGE CV] Analysis API: Scale Calibration on {filename}")
+                print("\n" + "-"*50)
+                print(f"[BRIDGE CV] 🔬 FITUR AKTIF: Scale Calibration")
+                print(f"[BRIDGE CV] 📐 Menerapkan matriks kalibrasi lensa objektif pada {filename}...")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     res_file = classic_cv_editor.draw_scale_calibration(input_path)
-                    print(f"[BRIDGE CV] Selesai. Output: {res_file}")
+                    print(f"[BRIDGE CV] ✅ Kalibrasi Selesai. Output: {res_file}")
+                    print("-" * 50 + "\n")
                 else:
                     print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
 
             elif action == "CV_COLOR_SPLIT":
                 filename = data.get("filename")
-                print(f"[BRIDGE CV] Analysis API: Color Split on {filename}")
+                print("\n" + "-"*50)
+                print(f"[BRIDGE CV] 🎨 FITUR AKTIF: Color Channel Split")
+                print(f"[BRIDGE CV] 🧪 Memisahkan warna stain RGB spesifik pada {filename}...")
                 input_path = os.path.abspath(os.path.join("../Software/backend/static/uploads", filename))
                 if os.path.exists(input_path):
                     res_file = classic_cv_editor.split_color_channels(input_path)
-                    print(f"[BRIDGE CV] Selesai. Output: {res_file}")
+                    print(f"[BRIDGE CV] ✅ Pemisahan Warna Selesai. Output: {res_file}")
+                    print("-" * 50 + "\n")
                 else:
                     print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
+
+            elif action == "PURGE_CACHE":
+                print("[BRIDGE] 🧹 Menerima perintah PURGE_CACHE dari VPS.")
+                if os.path.exists(LOCAL_TMP_DIR):
+                    cleared = 0
+                    for file in os.listdir(LOCAL_TMP_DIR):
+                        if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                            file_path = os.path.join(LOCAL_TMP_DIR, file)
+                            try:
+                                os.remove(file_path)
+                                cleared += 1
+                            except: pass
+                    print(f"[BRIDGE] ✅ Purge selesai. {cleared} file dihapus dari {LOCAL_TMP_DIR}.")
 
         except Exception as e:
             print(f"[BRIDGE ERROR] Gagal memproses data handler: {e}")
@@ -404,7 +472,7 @@ async def send_stream_task(websocket):
                 if is_recording:
                     if recording_pending_init:
                         h, w = frame.shape[:2]
-                        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 - browser native
+                        fourcc = cv2.VideoWriter_fourcc(*'vp09')  # VP9 - browser native (WebM)
                         video_writer = cv2.VideoWriter(recording_filepath, fourcc, float(target_fps), (w, h))
                         if video_writer.isOpened():
                             recording_pending_init = False
@@ -450,19 +518,20 @@ async def telemetry_sender(websocket):
         try:
             status_data = motor_core.get_status()
             mem_stats = get_jetson_memory_stats()
-            await websocket.send(json.dumps({
-                "event": "TELEMETRY_DATA",
-                "status": status_data["status"],
-                "limit_switch": status_data.get("limit_switch", "N/A"),
-                "jetson_temperatures": get_jetson_temperatures(),
-                "ram_usage": mem_stats["ram"],
-                "rom_usage": mem_stats["rom"],
-                "position": {
-                    "X": status_data["X"],
-                    "Y": status_data["Y"],
-                    "Z": status_data["Z"]
-                }
-            }))
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "TELEMETRY_DATA",
+                    "status": status_data["status"],
+                    "limit_switch": status_data.get("limit_switch", "N/A"),
+                    "jetson_temperatures": get_jetson_temperatures(),
+                    "ram_usage": mem_stats["ram"],
+                    "rom_usage": mem_stats["rom"],
+                    "position": {
+                        "X": status_data["X"],
+                        "Y": status_data["Y"],
+                        "Z": status_data["Z"]
+                    }
+                }))
         except Exception:
             break
         await asyncio.sleep(0.2)
@@ -477,9 +546,10 @@ async def hardware_control_loop():
     
     while True:
         try:
-            async with websockets.connect(VPS_WS_URL) as websocket:
+            async with websockets.connect(VPS_WS_URL, max_size=None, ping_interval=None) as websocket:
                 print("[EDGE SUCCESS] Pipa jaringan asinkron ganda terhubung penuh!")
-                await websocket.send(json.dumps({"status": "READY", "device": "JETSON_ORIN_NANO"}))
+                async with ws_lock:
+                    await websocket.send(json.dumps({"status": "READY", "device": "JETSON_ORIN_NANO"}))
                 
                 await asyncio.gather(
                     receive_handler(websocket),
