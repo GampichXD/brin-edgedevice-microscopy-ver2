@@ -51,7 +51,12 @@ def sync_datasets():
                 
                 try:
                     with open(file_path, 'rb') as f:
-                        mime_type = 'video/webm' if file_name.lower().endswith('.webm') else ('video/mp4' if file_name.lower().endswith('.mp4') else 'image/jpeg')
+                        if file_name.lower().endswith('.mp4'):
+                            mime_type = 'video/mp4'
+                        elif file_name.lower().endswith('.webm'):
+                            mime_type = 'video/webm'
+                        else:
+                            mime_type = 'image/jpeg'
                         files = {'files': (file_name, f, mime_type)}
                         response = requests.post(sync_url, files=files, timeout=30)
                         

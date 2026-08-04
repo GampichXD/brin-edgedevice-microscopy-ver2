@@ -127,8 +127,8 @@ CONFIG = {
     'edge_threshold': 10,
     'use_gpu': True,                # Enable GPU acceleration (CUDA / OpenCL)
     'sift_max_keypoints': 2048,      # Maximum keypoints per ROI crop (reduced for edge devices)
-    'debug': False,                 # Gate visualization plotting to avoid headless display hangs
-    'evaluate_metrics': False,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
+    'debug': True,                 # Gate visualization plotting to avoid headless display hangs
+    'evaluate_metrics': True,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
 }
 # ============================================================
 # STEP 1: Image Loading & Coordinate Extraction
@@ -1249,7 +1249,7 @@ def visualize_blending_debug(debug_info, final_image):
 # ============================================================
 
 if __name__ == '__main__':
-    folder_path = "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/7x7"   # ← change this
+    folder_path = "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/5x5_ecoli"   # ← change this
 
     # Initialize Performance & Memory Tracker
     tracker = PerformanceTracker(f"SIFT + BFMatcher Pipeline ({CONFIG['feature_method'].upper()})")

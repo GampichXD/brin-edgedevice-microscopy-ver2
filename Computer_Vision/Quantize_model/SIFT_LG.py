@@ -179,10 +179,10 @@ CONFIG = {
     'normalization_method': 'skimage_histogram_match',
 
     # --- Weights (local path — no internet required after setup) ---
-    'weights_dir': os.path.join(os.path.dirname(__file__), 'weights'),
+    'weights_dir': os.path.join(os.path.dirname(__file__), 'Weights'),
 
     # --- SIFT (LightGlue built-in extractor) ---
-    'sift_max_keypoints':  1024,   # keypoints per ROI; -1 = unlimited (reduced for edge devices)
+    'sift_max_keypoints':  2048,   # keypoints per ROI; -1 = unlimited (reduced for edge devices)
     'sift_peak_threshold': 0.01,   # DoG peak threshold; lower = more keypoints
     'sift_edge_threshold': 10,     # Harris edge threshold
 
@@ -199,9 +199,10 @@ CONFIG = {
     # --- Device ---
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'use_gpu': True,               # Enable GPU acceleration (CUDA / OpenCL)
-    'debug': False,                 # Gate visualization plotting to avoid headless display hangs
-    'evaluate_metrics': False,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
+    'debug': True,                 # Gate visualization plotting to avoid headless display hangs
+    'evaluate_metrics': True,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
     'enable_benchmark': True,       # Toggle Performance & Memory Tracker benchmarking
+    'use_amp': True,                # Toggle PyTorch Automatic Mixed Precision (AMP)
 }
 
 
@@ -566,8 +567,12 @@ def _extract_region(gray, region, extractor, device):
     # Fallback to lightglue SIFT wrapper
     DETECTOR_ACCEL = "CPU"
     tensor = _image_to_tensor(roi, device)
+    use_amp = CONFIG.get('use_amp', True)
+    device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
+    amp_dtype = torch.bfloat16 if device_type == 'cpu' else torch.float16
     with torch.no_grad():
-        feats = extractor.extract(tensor)
+        with torch.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
+            feats = extractor.extract(tensor)
     feats = rbd(feats)                                   # remove batch dim
 
     kps    = feats['keypoints'].cpu().numpy()             # (N, 2)
@@ -770,8 +775,12 @@ def match_overlap_features(overlap_features, image_data, matcher, device):
                                      scales=fd.get('scales2'),
                                      oris=fd.get('oris2'))
 
+            use_amp = CONFIG.get('use_amp', True)
+            device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
+            amp_dtype = torch.bfloat16 if device_type == 'cpu' else torch.float16
             with torch.no_grad():
-                result = matcher({'image0': f0, 'image1': f1})
+                with torch.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
+                    result = matcher({'image0': f0, 'image1': f1})
 
             result = rbd(result)   # remove batch dim
 
@@ -1644,7 +1653,7 @@ def extract_roi(image, roi_info, padding=5):
 
 if __name__ == '__main__':
     # ---- Change this to your tile folder ----------------
-    folder_path = "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/3x3"
+    folder_path = "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/5x5_ecoli"
     # -----------------------------------------------------
 
     # Initialize Performance & Memory Tracker

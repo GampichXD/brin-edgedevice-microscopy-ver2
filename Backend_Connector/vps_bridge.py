@@ -8,6 +8,7 @@ import cv2
 import time
 from datetime import datetime
 import shutil
+import psutil
 
 # Impor driver inti dan modul AI dari folder Hardware
 from Hardware.Devices.motor import motor_core
@@ -524,6 +525,7 @@ async def telemetry_sender(websocket):
                     "status": status_data["status"],
                     "limit_switch": status_data.get("limit_switch", "N/A"),
                     "jetson_temperatures": get_jetson_temperatures(),
+                    "edge_cpu_usage": psutil.cpu_percent(interval=None),
                     "ram_usage": mem_stats["ram"],
                     "rom_usage": mem_stats["rom"],
                     "position": {
