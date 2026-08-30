@@ -9,7 +9,15 @@ subsistem mekatronika, driver device, dan jembatan data internet (VPS).
 
 import sys
 import os
+import signal
 import asyncio
+try:
+    from dotenv import load_dotenv
+    # Muat file .env jika ada (Sangat berguna untuk migrasi ke IP Publik VPS)
+    load_dotenv()
+except ImportError:
+    print("[SYSTEM WARNING] Modul 'python-dotenv' tidak ditemukan. Membaca Environment Variables dari OS/Terminal.")
+
 
 # ====================================================================
 # FIX RADIKAL: FORCE ROOT PATH RESOLUTION UNTUK WINDOWS & LINUX
@@ -58,9 +66,31 @@ def shutdown_system():
     print("[SHUTDOWN SUCCESS] Seluruh pin hardware aman. Sesi terminal ditutup.")
     print("="*65)
 
+
+_shutting_down = False
+
+def _handle_termination(signum, _frame):
+    """Tangkap SIGTERM/SIGINT/SIGHUP agar sensor kamera & port serial SELALU
+    dilepas bersih. Tanpa ini, `kill`/`systemctl`/stop dari IDE membunuh proses
+    tanpa menjalankan atexit -> gst-launch jadi yatim & nvargus-daemon 'bocor'
+    menahan sensor sehingga run berikutnya dapat 'No cameras available'."""
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+    print(f"\n[SYSTEM] Menerima sinyal {signal.Signals(signum).name}. Membersihkan hardware...")
+    shutdown_system()
+    os._exit(0)
+
 if __name__ == "__main__":
     print_banner()
-    
+
+    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(_sig, _handle_termination)
+        except (ValueError, OSError):
+            pass
+
     # Jalankan daemon sinkronisasi cloud di background (non-blocking)
     syncer_thread = threading.Thread(target=run_daemon, daemon=True)
     syncer_thread.start()

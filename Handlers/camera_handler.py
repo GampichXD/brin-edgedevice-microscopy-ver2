@@ -127,3 +127,17 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
                         cleared += 1
                     except: pass
             print(f"[BRIDGE] ✅ Purge selesai. {cleared} file dihapus dari {LOCAL_TMP_DIR}.")
+            
+    elif action == "PURGE_ALL_DATASETS":
+        print("[BRIDGE] 🚨 Menerima perintah PURGE_ALL_DATASETS dari VPS!")
+        import shutil
+        # Hapus LOCAL_TMP_DIR isinya
+        if os.path.exists(LOCAL_TMP_DIR):
+            shutil.rmtree(LOCAL_TMP_DIR, ignore_errors=True)
+            os.makedirs(LOCAL_TMP_DIR, exist_ok=True)
+        # Hapus seluruh folder local_datasets
+        local_datasets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "local_datasets"))
+        if os.path.exists(local_datasets_dir):
+            shutil.rmtree(local_datasets_dir, ignore_errors=True)
+            os.makedirs(local_datasets_dir, exist_ok=True)
+        print("[BRIDGE] ✅ Seluruh data di Edge berhasil dimusnahkan.")

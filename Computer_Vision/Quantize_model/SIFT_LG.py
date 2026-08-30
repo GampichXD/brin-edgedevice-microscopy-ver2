@@ -1,11 +1,13 @@
 """
 Tile Stitching Pipeline -- SIFT + LightGlue Variant
 =====================================================
-Feature extraction             : SIFT  (LightGlue's built-in re-implementation)
+Feature extraction             : SIFT  (OpenCV cv2.SIFT_create -- identical detector
+                                  config to SIFT_BFM.py, so keypoint counts are
+                                  directly comparable between the two variants)
 Feature matching               : LightGlue  (features='sift')
 Homography + RANSAC            : cv2.findHomography  (unchanged)
 Reprojection error             : calculate_reprojection_error (unchanged)
-NCC evaluation                 : compute_ncc / calculate_overlap_ncc (unchanged)
+NCC evaluation                 : calculate_overlap_ncc (unchanged)
 Overlap quality metrics        : PSNR, SSIM, RMSE, NCC (unchanged)
 Feather blending               : blend_panorama (unchanged)
 ROI crop                       : find_roi / extract_roi (unchanged)
@@ -49,12 +51,10 @@ import torch
 from skimage.metrics import structural_similarity as ssim
 from skimage.exposure import match_histograms
 
-from lightglue import LightGlue, SIFT
-from lightglue import LightGlue, SIFT
+from lightglue import LightGlue
 from lightglue.utils import rbd   # remove_batch_dim helper
 
 warnings.filterwarnings('ignore')
-cv2.ocl.setUseOpenCL(False)
 
 import time
 try:
@@ -176,13 +176,20 @@ CONFIG = {
     'display_feather_distance':  30,  # soft feather for human viewing
     'analysis_feather_distance': 0,   # hard seam for analysis/training copy
     'feather_distance':     30,       # legacy alias — used by blend_panorama
+    'save_analysis_copy':   False,     # also save a hard-seam copy alongside the soft display one
+    # 'cuda' moves blend_panorama's per-tile blend arithmetic (masking, feather-weight
+    # computation, canvas accumulation) onto the GPU via PyTorch tensors -- this is the
+    # O(canvas_size x 3 channels x num_tiles) part that gets slow on grids beyond ~5x5.
+    # The geometric warp + mask erode/distanceTransform stay on CPU via OpenCV either way
+    # (this build's OpenCV has no CUDA support to swap those to). Set to 'cpu' to disable.
+    'feather_blend_device': 'cpu' if torch.cuda.is_available() else 'cpu',
     'normalization_method': 'skimage_histogram_match',
 
     # --- Weights (local path — no internet required after setup) ---
     'weights_dir': os.path.join(os.path.dirname(__file__), 'Weights'),
 
-    # --- SIFT (LightGlue built-in extractor) ---
-    'sift_max_keypoints':  2048,   # keypoints per ROI; -1 = unlimited (reduced for edge devices)
+    # --- SIFT (OpenCV cv2.SIFT_create -- same call as SIFT_BFM.py) ---
+    'sift_max_keypoints':  1024,   # keypoints per ROI; -1 = unlimited (reduced for edge devices)
     'sift_peak_threshold': 0.01,   # DoG peak threshold; lower = more keypoints
     'sift_edge_threshold': 10,     # Harris edge threshold
 
@@ -198,11 +205,11 @@ CONFIG = {
 
     # --- Device ---
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'use_gpu': True,               # Enable GPU acceleration (CUDA / OpenCL)
     'debug': True,                 # Gate visualization plotting to avoid headless display hangs
     'evaluate_metrics': True,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
     'enable_benchmark': True,       # Toggle Performance & Memory Tracker benchmarking
     'use_amp': True,                # Toggle PyTorch Automatic Mixed Precision (AMP)
+    'verbose_pair_metrics': False,   # Print PSNR/SSIM/NCC/RepError per pair (off = final summary only)
 }
 
 
@@ -210,23 +217,25 @@ CONFIG = {
 # MODEL — instantiated once, reused for all pairs
 # ============================================================
 
-def build_extractor_matcher(cfg=None):
+def build_matcher(cfg=None):
     """
-    Instantiate LightGlue SIFT extractor and LightGlue matcher
-    using LOCAL pretrained weights (no internet required).
+    Instantiate the LightGlue (sift) matcher using LOCAL pretrained weights
+    (no internet required).
+
+    SIFT extraction itself uses OpenCV's cv2.SIFT_create() directly (see
+    _extract_region()), built fresh per ROI just like SIFT_BFM.py's
+    select_descriptor() -- there is no upfront extractor model to build.
 
     Weight files expected in cfg['weights_dir']:
-        sift_lightglue_v0-1_arxiv.pth
-    (SIFT detection itself uses OpenCV — no weights needed for the extractor.)
+        sift_lightglue.pth
     """
     cfg    = cfg or CONFIG
     device = torch.device(cfg['device'])
 
     weights_dir = cfg['weights_dir']
 
-    # Only LightGlue needs weights — SIFT uses OpenCV internally
     required = {
-        'sift_lightglue_v0-1_arxiv.pth': 'LightGlue (sift) matcher',
+        'sift_lightglue.pth': 'LightGlue (sift) matcher',
     }
     for fname, label in required.items():
         fpath = os.path.join(weights_dir, fname)
@@ -248,13 +257,6 @@ def build_extractor_matcher(cfg=None):
             shutil.copy2(src, link)
 
     try:
-        extractor = (
-            SIFT(max_num_keypoints=cfg['sift_max_keypoints'],
-                 peak_threshold=cfg['sift_peak_threshold'],
-                 edge_threshold=cfg['sift_edge_threshold'])
-            .eval()
-            .to(device)
-        )
         matcher = (
             LightGlue(features='sift',
                       depth_confidence=cfg['lg_depth_confidence'],
@@ -266,11 +268,10 @@ def build_extractor_matcher(cfg=None):
     finally:
         torch.hub.set_dir(original_hub_dir)
 
-    print(f"[INFO] SIFT extractor ready (OpenCV, no weights needed)")
     print(f"[INFO] LightGlue (SIFT) loaded from: "
-          f"{os.path.join(weights_dir, 'sift_lightglue_v0-1_arxiv.pth')}")
+          f"{os.path.join(weights_dir, 'sift_lightglue.pth')}")
     print(f"[INFO] Device: {device}")
-    return extractor, matcher, device
+    return matcher, device
 
 
 # ============================================================
@@ -493,20 +494,28 @@ def visualize_overlap_regions(image_data, overlap_pairs, grid_info):
 # STEP 3 : Feature Extraction -- LightGlue SIFT
 # ============================================================
 
-def _image_to_tensor(gray_uint8, device):
+def _sift_to_rootsift(descs, eps=1e-6):
+    """L1-normalize, sqrt, then L2-normalize each descriptor row (RootSIFT).
+
+    This is the transform LightGlue's own SIFT extractor applies by default
+    (rootsift=True) before matching, and the pretrained sift_lightglue.pth
+    matcher weights were trained expecting it -- feeding raw SIFT descriptors
+    instead measurably hurts match quality even with identical keypoints.
+    Applied only to descriptor values, so it has no effect on keypoint count.
     """
-    LightGlue SIFT extractor expects float32 tensor in [0, 1]
-    with shape (1, 1, H, W).
-    """
-    t = torch.from_numpy(gray_uint8).float() / 255.0   # (H, W)
-    return t.unsqueeze(0).unsqueeze(0).to(device)       # (1, 1, H, W)
+    l1 = np.sum(np.abs(descs), axis=1, keepdims=True)
+    x = descs / np.maximum(l1, eps)
+    x = np.sqrt(np.clip(x, eps, None))
+    l2 = np.linalg.norm(x, axis=1, keepdims=True)
+    return (x / np.maximum(l2, eps)).astype(np.float32)
 
 
-def _extract_region(gray, region, extractor, device):
+def _extract_region(gray, region):
     """
-    Run SIFT extraction on one ROI crop.
-    Uses OpenCL-accelerated OpenCV SIFT if CONFIG['use_gpu'] is enabled and supported,
-    otherwise falls back to lightglue's extractor.
+    Run SIFT extraction (OpenCV) on one ROI crop -- the exact same
+    cv2.SIFT_create() configuration as SIFT_BFM.py's select_descriptor(),
+    on the same CLAHE'd ROI, so keypoint counts are directly comparable
+    between the two pipeline variants.
 
     Returns
     -------
@@ -514,7 +523,7 @@ def _extract_region(gray, region, extractor, device):
     coordinates, or None if no keypoints found.
 
     keypoints   : (N, 2)   float32  -- (x, y), shifted to full-image space
-    descriptors : (N, 128) float32  -- 128-dim SIFT vectors
+    descriptors : (N, 128) float32  -- RootSIFT-normalized 128-dim vectors
     scores      : (N,)     float32  -- DoG response values
     scales      : (N,)     float32  -- keypoint scale   (SIFT-specific)
     oris        : (N,)     float32  -- keypoint orientation in rad (SIFT-specific)
@@ -531,70 +540,35 @@ def _extract_region(gray, region, extractor, device):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     roi = clahe.apply(roi)
 
-    use_gpu = CONFIG.get('use_gpu', True)
-    if use_gpu and cv2.ocl.haveOpenCL():
-        try:
-            cv2.ocl.setUseOpenCL(True)
-            sift_max_kps = CONFIG.get('sift_max_keypoints', 4096)
-            nfeatures = sift_max_kps if sift_max_kps != -1 else 0
-            detector = cv2.SIFT_create(
-                nfeatures=nfeatures,
-                contrastThreshold=CONFIG['sift_peak_threshold'],
-                edgeThreshold=CONFIG['sift_edge_threshold'],
-                sigma=1.6
-            )
-            umat_roi = cv2.UMat(roi)
-            kps_cv, descs_cv = detector.detectAndCompute(umat_roi, None)
-            
-            if kps_cv and descs_cv is not None:
-                descs = descs_cv.get()  # Convert cv2.UMat back to NumPy array
-                
-                # Format keypoints attributes as NumPy arrays
-                kps = np.float32([kp.pt for kp in kps_cv])
-                scs = np.float32([kp.response for kp in kps_cv])
-                scales = np.float32([kp.size for kp in kps_cv])
-                oris = np.float32([kp.angle * np.pi / 180.0 for kp in kps_cv])
-                
-                # Shift ROI-local coordinates to full-image space
-                kps[:, 0] += x
-                kps[:, 1] += y
-                
-                DETECTOR_ACCEL = "GPU (OpenCL SIFT)"
-                return kps, descs, scs, scales, oris
-        except Exception as e:
-            print(f"[WARN] OpenCL SIFT extraction failed, falling back to CPU: {e}")
-
-    # Fallback to lightglue SIFT wrapper
+    sift_max_kps = CONFIG.get('sift_max_keypoints', 1024)
+    nfeatures = sift_max_kps if sift_max_kps != -1 else 0
+    detector = cv2.SIFT_create(
+        nfeatures=nfeatures,
+        contrastThreshold=CONFIG['sift_peak_threshold'],
+        edgeThreshold=CONFIG['sift_edge_threshold'],
+        sigma=1.6
+    )
+    kps_cv, descs = detector.detectAndCompute(roi, None)
     DETECTOR_ACCEL = "CPU"
-    tensor = _image_to_tensor(roi, device)
-    use_amp = CONFIG.get('use_amp', True)
-    device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
-    amp_dtype = torch.bfloat16 if device_type == 'cpu' else torch.float16
-    with torch.no_grad():
-        with torch.autocast(device_type=device_type, enabled=use_amp, dtype=amp_dtype):
-            feats = extractor.extract(tensor)
-    feats = rbd(feats)                                   # remove batch dim
-
-    kps    = feats['keypoints'].cpu().numpy()             # (N, 2)
-    descs  = feats['descriptors'].cpu().numpy()           # (N, 128)
-    scs    = feats['keypoint_scores'].cpu().numpy()       # (N,)
-    # SIFT-specific: scale and orientation are required by LightGlue's SIFT
-    # positional encoding.  Both fields are always present in LightGlue >= 0.1.
-    scales = feats['scales'].cpu().numpy() if 'scales' in feats else None  # (N,)
-    oris   = feats['oris'].cpu().numpy()   if 'oris'   in feats else None  # (N,)
-
-    if len(kps) == 0:
+    if not kps_cv or descs is None:
         return None
+    descs = _sift_to_rootsift(descs)
 
-    # Shift from ROI-local to full-image coordinates
+    # Format keypoint attributes as NumPy arrays
+    kps    = np.float32([kp.pt for kp in kps_cv])
+    scs    = np.float32([kp.response for kp in kps_cv])
+    scales = np.float32([kp.size for kp in kps_cv])
+    oris   = np.float32([kp.angle * np.pi / 180.0 for kp in kps_cv])
+
+    # Shift ROI-local coordinates to full-image space
     kps[:, 0] += x
     kps[:, 1] += y
     return kps, descs, scs, scales, oris
 
 
-def extract_overlap_features(image_data, overlap_pairs, extractor, device):
+def extract_overlap_features(image_data, overlap_pairs):
     """
-    Run LightGlue SIFT on every overlap ROI.
+    Run SIFT extraction on every overlap ROI.
 
     Returns
     -------
@@ -616,10 +590,8 @@ def extract_overlap_features(image_data, overlap_pairs, extractor, device):
         direction      = pair['direction']
 
         try:
-            feats1 = _extract_region(image_data[coord1]['image_gray'],
-                                     r1, extractor, device)
-            feats2 = _extract_region(image_data[coord2]['image_gray'],
-                                     r2, extractor, device)
+            feats1 = _extract_region(image_data[coord1]['image_gray'], r1)
+            feats2 = _extract_region(image_data[coord2]['image_gray'], r2)
 
             if feats1 is None or feats2 is None:
                 print(f"[SKIP] {coord1}<->{coord2}: SIFT returned nothing")
@@ -687,7 +659,7 @@ def visualize_overlap_features(image_data, overlap_features, grid_info):
             f'{coords}\nH:{dir_counts["horizontal"]} V:{dir_counts["vertical"]}',
             fontsize=10)
 
-    plt.suptitle('SIFT Keypoints -- LightGlue extractor (overlap regions only)',
+    plt.suptitle('SIFT Keypoints -- OpenCV extractor (overlap regions only)',
                  fontsize=16)
     plt.tight_layout()
     return fig
@@ -1041,17 +1013,29 @@ def evaluate_homography_reprojection(match_result, homography_results,
             'min_error':     round(reproj['min'],    3),
             'max_error':     round(reproj['max'],    3),
         })
-        print(f"OK {coord1}<>{coord2}: reprojection "
-              f"mean={reproj['mean']:.3f} "
-              f"median={reproj['median']:.3f} "
-              f"min={reproj['min']:.3f} "
-              f"max={reproj['max']:.3f}")
+        if CONFIG.get('verbose_pair_metrics', False):
+            print(f"OK {coord1}<>{coord2}: reprojection "
+                  f"mean={reproj['mean']:.3f} "
+                  f"median={reproj['median']:.3f} "
+                  f"min={reproj['min']:.3f} "
+                  f"max={reproj['max']:.3f}")
 
     if results:
         _save_csv(results, output_csv,
                   ['tile1_coord', 'tile2_coord', 'match_count', 'inliers',
                    'mean_error', 'median_error', 'min_error', 'max_error'])
+    _print_reprojection_summary(results)
     return results
+
+
+def _print_reprojection_summary(results):
+    if not results:
+        return
+    print(f"\n REPROJECTION ERROR SUMMARY:")
+    for key in ('mean_error', 'median_error', 'min_error', 'max_error'):
+        vals = [r[key] for r in results]
+        print(f"{key.upper():12s} -- mean={np.mean(vals):.3f} std={np.std(vals):.3f} "
+              f"min={np.min(vals):.3f} max={np.max(vals):.3f}")
 
 
 # ============================================================
@@ -1176,22 +1160,6 @@ def _to_gray_for_ncc(img):
     if a.ndim == 3 and a.shape[2] == 1:
         return a[:, :, 0].astype(np.float32)
     return a.astype(np.float32)
-
-
-def compute_ncc(region1, region2):
-    """NCC in [-1, 1] between two same-shape image regions."""
-    if region1 is None or region2 is None:
-        return None
-    if region1.shape != region2.shape:
-        raise ValueError('Regions must have same shape for NCC')
-    a = _to_gray_for_ncc(region1)
-    b = _to_gray_for_ncc(region2)
-    if a.size == 0 or b.size == 0:
-        return 0.0
-    a -= a.mean()
-    b -= b.mean()
-    denom = np.sqrt(np.sum(a * a) * np.sum(b * b))
-    return float(np.sum(a * b) / denom) if denom > 1e-10 else 0.0
 
 
 def calculate_overlap_ncc(image_data, transforms, coord1, coord2,
@@ -1403,10 +1371,11 @@ def evaluate_overlap_metrics(image_data, transforms, reachable_images,
                 'rmse':           round(rmse, 3),
                 'ncc':            round(ncc, 4) if ncc is not None else None,
             })
-            print(f"OK {coord1} <> {coord2}: "
-                  f"PSNR={psnr:.2f} SSIM={s:.3f} "
-                  f"RMSE={rmse:.2f} NCC={ncc if ncc is not None else 'N/A'}"
-                  f" | {n_pixels}px")
+            if CONFIG.get('verbose_pair_metrics', False):
+                print(f"OK {coord1} <> {coord2}: "
+                      f"PSNR={psnr:.2f} SSIM={s:.3f} "
+                      f"RMSE={rmse:.2f} NCC={ncc if ncc is not None else 'N/A'}"
+                      f" | {n_pixels}px")
 
         except Exception as e:
             print(f"[ERROR] {coord1} <> {coord2}: {e}")
@@ -1451,7 +1420,7 @@ def _print_metric_summary(results):
 # ============================================================
 
 def blend_panorama(image_data, transforms, reachable_images,
-                   canvas_w, canvas_h, offset_x, offset_y):
+                   canvas_w, canvas_h, offset_x, offset_y, feather_distance=None):
     """
     Warp and feather-blend all reachable tiles onto a single canvas.
 
@@ -1467,11 +1436,27 @@ def blend_panorama(image_data, transforms, reachable_images,
     simultaneously (e.g. ~7.5 GB for 25 × 300 MB tiles).  The new approach
     peak RAM is O(canvas_size), regardless of N.
 
+    Parameters
+    ----------
+    feather_distance : float, optional
+        Width in px of the soft blend transition at tile seams. Defaults to
+        CONFIG['feather_distance']. <= 0 switches to a hard, winner-take-all
+        seam instead: each overlap pixel goes entirely to whichever tile is
+        more "interior" there (larger distance-to-its-own-edge) with no
+        color mixing, for an analysis/training copy where blended/ghosted
+        seam pixels are undesirable (matches CONFIG['analysis_feather_distance']).
+        Naively passing feather_distance=0 into the old soft-blend formula
+        divided by zero (silently producing inf/nan at seams) -- this is
+        the fix for that, not just a threshold tweak.
+
     Returns
     -------
     final      : np.uint8  (H, W, 3)  -- blended panorama
     debug_info : dict  -- overlap_count, weight_map, valid_pixels, overlap_stats
     """
+    feather_distance = CONFIG['feather_distance'] if feather_distance is None else feather_distance
+    hard_seam = feather_distance <= 0
+
     offset_matrix = np.array([[1, 0, offset_x],
                                [0, 1, offset_y],
                                [0, 0, 1]], dtype=np.float32)
@@ -1493,42 +1478,123 @@ def blend_panorama(image_data, transforms, reachable_images,
     # ------------------------------------------------------------------
     # Pass 2 : blend -- one warp in RAM at a time
     # ------------------------------------------------------------------
+    # The geometric warp + mask erode/distanceTransform stay on CPU via
+    # OpenCV regardless of feather_blend_device -- this build's OpenCV has
+    # no CUDA support (cv2.cuda.getCudaEnabledDeviceCount() == 0) and
+    # reimplementing warpPerspective's exact interpolation in PyTorch risks
+    # subtly changing stitching quality for a part that isn't the actual
+    # bottleneck. What moves to GPU when requested is the per-tile blend
+    # arithmetic below -- full 3-channel canvas-sized elementwise ops,
+    # repeated once per tile, which is what actually scales up on grids
+    # beyond ~5x5.
+    blend_device  = CONFIG.get('feather_blend_device', 'cpu')
+    requested_gpu = blend_device == 'cuda'
+    use_gpu       = requested_gpu and torch.cuda.is_available()
+    if requested_gpu and not use_gpu:
+        print("[WARN] feather_blend_device='cuda' requested but CUDA is not available -- using CPU.")
+
     kernel = np.ones((5, 5), np.uint8)
-    print(f"Pass 2 -- blending ({len(reachable_images)} tiles) ...")
+    print(f"Pass 2 -- blending ({len(reachable_images)} tiles) ... [{'GPU' if use_gpu else 'CPU'}]")
+
+    if use_gpu:
+        canvas_t        = torch.zeros((canvas_h, canvas_w, 3), dtype=torch.float32, device='cuda')
+        weight_map_t    = torch.zeros((canvas_h, canvas_w),    dtype=torch.float32, device='cuda')
+        overlap_count_t = torch.from_numpy(overlap_count).to('cuda')
+
     for coord in reachable_images:
         img    = image_data[coord]['image'].astype(np.float32)
         T_adj  = offset_matrix @ transforms[coord]
         warped = cv2.warpPerspective(img, T_adj, (canvas_w, canvas_h))
         mask   = (warped.sum(axis=2) > 0).astype(np.uint8)
 
-        inner        = cv2.erode(mask, kernel, iterations=2)
-        dist         = cv2.distanceTransform(inner, cv2.DIST_L2, 5)
-        max_dist     = dist.max()
-        feather_zone = (min(CONFIG['feather_distance'], max_dist * 0.3)
-                        if max_dist > 0 else 1)
-        feather      = np.minimum(dist / feather_zone, 1.0) * mask.astype(np.float32)
+        inner = cv2.erode(mask, kernel, iterations=2)
+        dist  = cv2.distanceTransform(inner, cv2.DIST_L2, 5)
 
-        overlap_here = (overlap_count * mask) > 1
-        new_here     = (weight_map == 0) & (feather > 0)
+        if use_gpu:
+            warped_t = torch.from_numpy(warped).to('cuda')
+            mask_t   = torch.from_numpy(mask).to('cuda').bool()
+            dist_t   = torch.from_numpy(dist).to('cuda')
+            mask_f_t = mask_t.to(torch.float32)
 
-        for c in range(3):
-            canvas[:, :, c][new_here] = warped[:, :, c][new_here]
-        weight_map[new_here] = feather[new_here]
+            if hard_seam:
+                feather_t = dist_t * mask_f_t
+            else:
+                max_dist     = dist_t.max().item()
+                feather_zone = (min(feather_distance, max_dist * 0.3) if max_dist > 0 else 1)
+                feather_t    = torch.clamp(dist_t / feather_zone, max=1.0) * mask_f_t
 
-        if overlap_here.any():
-            cur_w = feather[overlap_here]
-            ext_w = weight_map[overlap_here]
-            total = cur_w + ext_w
-            alpha = np.divide(cur_w, total,
-                              out=np.zeros_like(cur_w), where=total != 0)
+            overlap_here_t = (overlap_count_t * mask_t) > 1
+            new_here_t     = (weight_map_t == 0) & (feather_t > 0)
+
+            canvas_t[new_here_t]     = warped_t[new_here_t]
+            weight_map_t[new_here_t] = feather_t[new_here_t]
+
+            if overlap_here_t.any():
+                cur_w = feather_t[overlap_here_t]
+                ext_w = weight_map_t[overlap_here_t]
+                if hard_seam:
+                    win_mask_t = torch.zeros_like(mask_t)
+                    win_mask_t[overlap_here_t] = cur_w > ext_w
+                    canvas_t[win_mask_t] = warped_t[win_mask_t]
+                else:
+                    total = cur_w + ext_w
+                    alpha = torch.where(total != 0, cur_w / total, torch.zeros_like(cur_w))
+                    canvas_t[overlap_here_t] = (
+                        alpha.unsqueeze(-1) * warped_t[overlap_here_t] +
+                        (1 - alpha).unsqueeze(-1) * canvas_t[overlap_here_t]
+                    )
+                weight_map_t[overlap_here_t] = torch.maximum(ext_w, cur_w)
+
+            del warped, warped_t, mask_t, dist_t, feather_t  # free immediately
+
+        else:
+            if hard_seam:
+                # Priority score for winner-take-all ownership -- deliberately
+                # NOT capped to [0,1] the way the soft-blend alpha below is,
+                # since it's never used as a blend weight in this mode, only
+                # compared against other tiles' scores at the same pixel.
+                feather = dist * mask.astype(np.float32)
+            else:
+                max_dist     = dist.max()
+                feather_zone = (min(feather_distance, max_dist * 0.3)
+                                if max_dist > 0 else 1)
+                feather      = np.minimum(dist / feather_zone, 1.0) * mask.astype(np.float32)
+
+            overlap_here = (overlap_count * mask) > 1
+            new_here     = (weight_map == 0) & (feather > 0)
+
             for c in range(3):
-                canvas[:, :, c][overlap_here] = (
-                    alpha * warped[:, :, c][overlap_here] +
-                    (1 - alpha) * canvas[:, :, c][overlap_here]
-                )
-            weight_map[overlap_here] = np.maximum(ext_w, cur_w)
+                canvas[:, :, c][new_here] = warped[:, :, c][new_here]
+            weight_map[new_here] = feather[new_here]
 
-        del warped  # free immediately
+            if overlap_here.any():
+                cur_w = feather[overlap_here]
+                ext_w = weight_map[overlap_here]
+                if hard_seam:
+                    # No color mixing: each overlap pixel goes entirely to
+                    # whichever tile currently has the higher priority score.
+                    win_mask = np.zeros_like(mask, dtype=bool)
+                    win_mask[overlap_here] = cur_w > ext_w
+                    for c in range(3):
+                        canvas[:, :, c][win_mask] = warped[:, :, c][win_mask]
+                else:
+                    total = cur_w + ext_w
+                    alpha = np.divide(cur_w, total,
+                                      out=np.zeros_like(cur_w), where=total != 0)
+                    for c in range(3):
+                        canvas[:, :, c][overlap_here] = (
+                            alpha * warped[:, :, c][overlap_here] +
+                            (1 - alpha) * canvas[:, :, c][overlap_here]
+                        )
+                weight_map[overlap_here] = np.maximum(ext_w, cur_w)
+
+            del warped  # free immediately
+
+    if use_gpu:
+        canvas     = canvas_t.cpu().numpy()
+        weight_map = weight_map_t.cpu().numpy()
+        del canvas_t, weight_map_t, overlap_count_t
+        torch.cuda.empty_cache()
 
     valid = weight_map > 0
     final = np.zeros_like(canvas, dtype=np.uint8)
@@ -1652,17 +1718,19 @@ def extract_roi(image, roi_info, padding=5):
 # ============================================================
 
 if __name__ == '__main__':
-    # ---- Change this to your tile folder ----------------
-    folder_path = "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/5x5_ecoli"
-    # -----------------------------------------------------
+    import argparse
+    _parser = argparse.ArgumentParser(description="SIFT + LightGlue tile stitching")
+    _parser.add_argument('--path', default="/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/10x10_euglena_red",
+                         help="Folder of tile images to stitch")
+    folder_path = _parser.parse_args().path
 
     # Initialize Performance & Memory Tracker
     tracker = None
     if CONFIG.get('enable_benchmark', True):
         tracker = PerformanceTracker("SIFT + LightGlue Pipeline (SIFT_LG)")
 
-    # Build SIFT extractor + LightGlue matcher (once)
-    extractor, matcher, device = build_extractor_matcher(CONFIG)
+    # Build LightGlue matcher (once) -- SIFT extraction needs no upfront model
+    matcher, device = build_matcher(CONFIG)
     if tracker:
         tracker.record_step("0. Model Loading & Initialization")
 
@@ -1683,9 +1751,8 @@ if __name__ == '__main__':
     if tracker:
         tracker.record_step("2. Overlap Region Setup")
 
-    # Step 3 -- SIFT extraction on each ROI (LightGlue's built-in SIFT)
-    overlap_features = extract_overlap_features(
-        image_data, overlap_pairs, extractor, device)
+    # Step 3 -- SIFT extraction on each ROI (OpenCV)
+    overlap_features = extract_overlap_features(image_data, overlap_pairs)
     if CONFIG.get('debug', False):
         visualize_overlap_features(image_data, overlap_features, grid_info)
         plt.show()
@@ -1732,9 +1799,28 @@ if __name__ == '__main__':
         tracker.record_step("5.5 Overlap Quality Metrics Evaluation")
 
     # Step 6 -- Feather blending
+    # Hard-seam analysis copy first (if enabled), display copy second -- in
+    # that order so this copy's own save message (deliberately NOT phrased
+    # "Saved: ...", see below) never becomes the last "Saved: <path>.jpg"
+    # match in the process output, which is what automate.py's tile-runner
+    # parses to find the stitched panorama. Keeps automate.py picking up
+    # the same (display) file it always has, unaffected by this addition.
+    if CONFIG.get('save_analysis_copy', False):
+        analysis_blended, _ = blend_panorama(
+            image_data, transforms, reachable_images,
+            canvas_w, canvas_h, offset_x, offset_y,
+            feather_distance=CONFIG.get('analysis_feather_distance', 0),
+        )
+        analysis_roi_info = find_roi(analysis_blended, min_threshold=1, debug=False)
+        analysis_result, _ = extract_roi(analysis_blended, analysis_roi_info, padding=10)
+        analysis_save_path = str(Path(folder_path) / "result_sift_lg_analysis.jpg")
+        cv2.imwrite(analysis_save_path, cv2.cvtColor(analysis_result, cv2.COLOR_RGB2BGR))
+        print(f"[INFO] Hard-seam analysis copy written: {analysis_save_path}")
+
     blended, debug_info = blend_panorama(
         image_data, transforms, reachable_images,
         canvas_w, canvas_h, offset_x, offset_y,
+        feather_distance=CONFIG.get('display_feather_distance', CONFIG['feather_distance']),
     )
     if CONFIG.get('debug', False):
         visualize_blending_debug(debug_info, blended)

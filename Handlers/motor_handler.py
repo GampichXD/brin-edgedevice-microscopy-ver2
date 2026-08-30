@@ -1,12 +1,17 @@
 import json
+import asyncio
 from Hardware.Devices.motor import motor_core
 
 async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
-    """Router untuk instruksi mekanika CNC/Motor"""
+    """Router untuk instruksi mekanika CNC/Motor.
+    PENTING: Semua operasi serial motor dijalankan di thread pool agar
+    tidak memblokir asyncio event loop (dan memutus stream video/WebSocket).
+    """
     if action == "MOVE_MOTOR":
         gcode = data.get("gcode", "")
         print(f"[BRIDGE] Eksekusi G-Code: {gcode}")
-        grbl_resp = motor_core.jog_from_gcode(gcode)
+        # Jalankan operasi serial blocking di thread pool
+        grbl_resp = await asyncio.to_thread(motor_core.jog_from_gcode, gcode)
         
         async with ws_lock:
             await websocket.send(json.dumps({
@@ -17,7 +22,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
 
     elif action == "HOMING":
         print("[BRIDGE] Perintah VPS: Homing motor.")
-        grbl_resp = motor_core.homing()
+        grbl_resp = await asyncio.to_thread(motor_core.homing)
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
@@ -27,7 +32,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
 
     elif action == "UNLOCK":
         print("[BRIDGE] Perintah VPS: Unlock motor.")
-        grbl_resp = motor_core.unlock()
+        grbl_resp = await asyncio.to_thread(motor_core.unlock)
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
@@ -39,9 +44,11 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         print(
             f"[BRIDGE CNC] Settings diterima: feed={data.get('feed_rate')} backlash={data.get('backlash')} accel={data.get('acceleration')} settle={data.get('settle_time')}"
         )
-        motor_core.apply_motion_settings(
-            feed_rate=data.get("feed_rate"),
-            backlash=data.get("backlash"),
-            acceleration=data.get("acceleration"),
-            settle_time=data.get("settle_time"),
+        await asyncio.to_thread(
+            motor_core.apply_motion_settings,
+            data.get("feed_rate"),
+            data.get("backlash"),
+            data.get("acceleration"),
+            data.get("settle_time"),
         )
+

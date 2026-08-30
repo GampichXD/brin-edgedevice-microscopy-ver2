@@ -42,10 +42,12 @@ async def receive_handler(websocket):
             
             if action in ["MOVE_MOTOR", "HOMING", "UNLOCK", "APPLY_CNC_SETTINGS"]:
                 await handle_motor_action(action, data, websocket, ws_lock)
-            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "PURGE_CACHE"]:
+            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "PURGE_CACHE", "PURGE_ALL_DATASETS"]:
                 await handle_camera_action(action, data, websocket, ws_lock, state)
             elif action in ["START_STITCHING", "START_DL_COUNT", "APPLY_IMAGE_EDIT", "CV_COLONY_COUNT", "CV_THRESHOLD", "CV_CONTOUR", "CV_MORPHOLOGY", "CV_SOBEL", "CV_ROI", "CV_CALIBRATE", "CV_COLOR_SPLIT"]:
                 await handle_ai_action(action, data, websocket, ws_lock)
+            elif action == "PING":
+                pass # Abaikan sinyal keep-alive
             else:
                 print(f"[BRIDGE WARNING] Action tidak dikenali: {action}")
 
@@ -53,59 +55,60 @@ async def receive_handler(websocket):
             print(f"[BRIDGE ERROR] Gagal memproses data handler: {e}")
 
 async def send_stream_task(websocket, state):
-    """TASK 2: Membaca frame dari hardware Edge Camera secara asinkron lalu disiarkan ke VPS."""
+    """TASK 2: Membaca frame JPEG dari hardware Edge Camera secara asinkron lalu disiarkan ke VPS."""
     import numpy as np
     print("[BRIDGE] Task pemancar video stream aktif di background loop.")
     while True:
         start_t = time.time()
         try:
             if state["is_streaming"]:
-                # Capture as raw numpy array for both streaming and recording
-                frame = camera_core.capture_frame()
-                
-                # --- MOCK FALLBACK: Jika kamera offline, buat frame hitam agar stream & recording tetap berjalan ---
-                if frame is None:
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(frame, "CAMERA OFFLINE", (120, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (80, 80, 80), 3)
+                # Ambil JPEG bytes langsung dari buffer kamera (lebih efisien, skip re-encode)
+                jpeg_bytes = camera_core.capture_jpeg_bytes()
 
-                # Tulis ke video file jika sedang recording
-                if state["is_recording"]:
-                    if state["recording_pending_init"]:
-                        h, w = frame.shape[:2]
-                        fourcc = cv2.VideoWriter_fourcc(*'vp09')  # VP9 - browser native (WebM)
-                        state["video_writer"] = cv2.VideoWriter(state["recording_filepath"], fourcc, float(state["target_fps"]), (w, h))
-                        if state["video_writer"].isOpened():
-                            state["recording_pending_init"] = False
-                            print(f"[BRIDGE] VideoWriter berhasil diinisialisasi: {state['recording_filepath']} ({w}x{h} @ {state['target_fps']}fps)")
-                        else:
-                            print(f"[BRIDGE ERROR] VideoWriter gagal dibuka! Path: {state['recording_filepath']}")
-                            state["video_writer"] = None
-                            
-                    if state["video_writer"] is not None:
-                        state["video_writer"].write(frame)
-                    
-                # Encode to JPEG for websocket stream
-                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                if ret:
-                    frame_bytes = buffer.tobytes()
-                    base64_str = base64.b64encode(frame_bytes).decode('utf-8')
-                    await websocket.send(json.dumps({
-                        "event": "STREAM_DATA",
-                        "image": f"data:image/jpeg;base64,{base64_str}"
-                    }))
+                # --- MOCK FALLBACK: Jika kamera offline, buat frame hitam ---
+                if jpeg_bytes is None:
+                    fallback_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(fallback_frame, "CAMERA OFFLINE", (120, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (80, 80, 80), 3)
+                    ret, buf = cv2.imencode('.jpg', fallback_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    jpeg_bytes = buf.tobytes() if ret else None
+
+                # Tulis ke video file jika sedang recording (perlu decode ke numpy)
+                if state["is_recording"] and jpeg_bytes is not None:
+                    frame = camera_core.capture_frame()
+                    if frame is not None:
+                        if state["recording_pending_init"]:
+                            h, w = frame.shape[:2]
+                            fourcc = cv2.VideoWriter_fourcc(*'vp09')  # VP9 - browser native (WebM)
+                            state["video_writer"] = cv2.VideoWriter(state["recording_filepath"], fourcc, float(state["target_fps"]), (w, h))
+                            if state["video_writer"].isOpened():
+                                state["recording_pending_init"] = False
+                                print(f"[BRIDGE] VideoWriter berhasil diinisialisasi: {state['recording_filepath']} ({w}x{h} @ {state['target_fps']}fps)")
+                            else:
+                                print(f"[BRIDGE ERROR] VideoWriter gagal dibuka! Path: {state['recording_filepath']}")
+                                state["video_writer"] = None
+                        if state["video_writer"] is not None:
+                            state["video_writer"].write(frame)
+
+                # Kirim JPEG ke VPS via WebSocket (base64)
+                if jpeg_bytes is not None:
+                    base64_str = base64.b64encode(jpeg_bytes).decode('utf-8')
+                    async with ws_lock:
+                        await websocket.send(json.dumps({
+                            "event": "STREAM_DATA",
+                            "image": f"data:image/jpeg;base64,{base64_str}"
+                        }))
             else:
                 # Tidak streaming, tapi jika masih recording karena alasan apapun, jaga frame tetap masuk
                 if state["is_recording"] and not state["recording_pending_init"] and state["video_writer"] is not None:
                     frame = camera_core.capture_frame()
-                    if frame is None:
-                        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    state["video_writer"].write(frame)
+                    if frame is not None:
+                        state["video_writer"].write(frame)
                 await asyncio.sleep(0.2)
-                
+
         except Exception as e:
             print(f"[BRIDGE STREAM ERROR] Gagal mengirim stream: {e}")
             break
-        
+
         # FPS Limiter Calculation
         elapsed = time.time() - start_t
         ideal_delay = 1.0 / state["target_fps"]
@@ -116,7 +119,7 @@ async def telemetry_sender(websocket):
     """TASK 3: Mengirim data telemetri posisi nyata XYZ ke VPS untuk disiarkan ke Redis Pub/Sub."""
     while True:
         try:
-            status_data = motor_core.get_status()
+            status_data = await asyncio.to_thread(motor_core.get_status)
             mem_stats = get_jetson_memory_stats()
             async with ws_lock:
                 await websocket.send(json.dumps({

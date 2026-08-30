@@ -32,3 +32,38 @@ Thumbs.db
 # Environment variables
 .env
 .env.*
+
+# Motor position state
+motor_position.json
+
+# ─────────────────────────────────────────────────────────────────────────
+# BOBOT MODEL & ARTEFAK INFERENSI TERKOMPILASI
+# Besar (ratusan MB), bisa di-regenerate, tidak boleh masuk git.
+# Simpan di luar repo (drive lab / rilis / LFS). Dokumentasikan di README.
+# ─────────────────────────────────────────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+*.engine
+*.plan
+*.trt
+*.cache
+*.cache.lock
+*.timing.cache
+Computer_Vision/Quantize_model/Weights/
+Computer_Vision/Quantize_model/TensorRT/
+Computer_Vision/Quantize_model/ONNX/
+
+# ── Output eksperimen / benchmark (di-generate otomatis) ──
+Computer_Vision/runs/
+Computer_Vision/Euglena_Tiles/**/testing/
+**/result_*.jpg
+**/result_*.png
+**/result_*.json
+**/*_colonies.json
+**/*_analysis.jpg
+homography_reprojection*.csv
+overlap_metrics*.csv
+
+# ── Log crash ──
+crash_log.txt
