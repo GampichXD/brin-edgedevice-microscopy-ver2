@@ -40,6 +40,16 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
                 "grbl_response": grbl_resp
             }))
 
+    elif action == "SET_POSITION":
+        print(f"[BRIDGE CNC] Set koordinat kerja manual: X={data.get('x')} Y={data.get('y')} Z={data.get('z')}")
+        grbl_resp = await asyncio.to_thread(
+            motor_core.set_position, data.get("x", 0.0), data.get("y", 0.0), data.get("z", 0.0)
+        )
+        async with ws_lock:
+            await websocket.send(json.dumps({
+                "event": "MOTOR_MOVED", "status": "SUCCESS", "grbl_response": grbl_resp
+            }))
+
     elif action == "APPLY_CNC_SETTINGS":
         print(
             f"[BRIDGE CNC] Settings diterima: feed={data.get('feed_rate')} backlash={data.get('backlash')} accel={data.get('acceleration')} settle={data.get('settle_time')}"
@@ -50,5 +60,13 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
             data.get("backlash"),
             data.get("acceleration"),
             data.get("settle_time"),
+        )
+
+    elif action == "APPLY_SOFT_LIMITS":
+        print(f"[BRIDGE CNC] Soft limits diterima: enabled={data.get('enabled')} limits={data.get('limits')}")
+        await asyncio.to_thread(
+            motor_core.set_soft_limits,
+            data.get("enabled"),
+            data.get("limits"),
         )
 

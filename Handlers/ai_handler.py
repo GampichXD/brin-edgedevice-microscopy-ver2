@@ -1,14 +1,15 @@
 import os
+import sys
 import json
 import base64
 import glob
 import re
 import shutil
+import asyncio
 try:
     import requests
 except ImportError:
     requests = None
-from Hardware.Computer_Vision.Quantize_model.SP_LG import run_pipeline, CONFIG as SP_LG_CONFIG
 from Hardware.Computer_Vision.Quantize_model.colony_counting import count_colonies
 from Hardware.Computer_Vision.classic_cv_edit import classic_cv_editor
 
@@ -16,17 +17,33 @@ LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "t
 if not os.path.exists(LOCAL_TMP_DIR):
     os.makedirs(LOCAL_TMP_DIR)
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_QM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
+                                      "Computer_Vision", "Quantize_model"))
+
 # Host publik VPS untuk mengunduh tile yang tidak ada di memori lokal Edge
 # (mode "Input Images"). Diturunkan dari VPS_BASE_URL (".../api/dataset").
 _VPS_BASE = os.getenv("VPS_BASE_URL", "http://localhost:8000/api/dataset")
 VPS_STATIC_HOST = _VPS_BASE.split("/api/")[0] if "/api/" in _VPS_BASE else _VPS_BASE.rstrip("/")
 
-# Pilihan model stitching dari frontend -> backend SP_LG (cfg['backend']).
-_STITCH_BACKEND = {
-    "sp_lg_tensorrt": "tensorrt",
-    "sp_lg_pytorch": "pytorch",
-    "sp_lg_onnx": "onnx",
+# Pilihan model stitching (dari frontend) -> (script standalone, nama file hasil
+# yang ditulis script itu ke dalam folder --path).
+_STITCH_SCRIPTS = {
+    "sp_lg_tensorrt": ("SP_LG.py",      "result_sp_lg_tensorrt.jpg"),
+    "sift_bfm":       ("SIFT_BFM.py",   "result_sift_bfm.jpg"),
+    "sift_lg":        ("SIFT_LG.py",    "result_sift_lg.jpg"),
+    "brute_force":    ("brute_force.py", "result_brute_force.jpg"),
 }
+
+# Penanda di stdout pipeline -> (persen, label) untuk event STITCH_PROGRESS.
+_STITCH_MILESTONES = [
+    ("gambar dimuat",   25, "Memuat tile & menyusun grid"),
+    ("Dimensi Grid",    32, "Menghitung zona overlap"),
+    ("Reference image", 62, "Menautkan tile (feature matching)"),
+    ("Reachable",       74, "Menghitung transformasi global"),
+    ("blending",        86, "Feather blending"),
+    ("Saved:",          96, "Menyimpan hasil"),
+]
 
 # Bobot YOLO segmentation TensorRT (INT8) untuk perhitungan koloni -- lihat
 # Quantize_model/Weights/yolo_model/. .engine tidak menyimpan metadata task
@@ -57,16 +74,34 @@ def _fmt_coord(v):
     return s if s not in ("", "-") else "0"
 
 
-def _resolve_tile_source(t):
-    """Kembalikan path lokal ke gambar tile. Pakai file di LOCAL_TMP_DIR kalau
-    ada (kasus Auto/Manual Gather); kalau tidak, unduh dari URL publik VPS
-    (kasus 'Input Images' dari database/upload)."""
-    fname = (t or {}).get("filename")
+def _safe_session(s):
+    """ID sesi -> nama folder aman (samakan dengan Handlers/camera_handler.py)."""
+    return re.sub(r"[^A-Za-z0-9_-]", "", str(s))[:40] or "adhoc"
+
+
+def _resolve_tile_source(t, session=None):
+    """Kembalikan path lokal ke gambar tile. Urutan:
+    (a) tmp_images/<session>/tile_r<gy>_c<gx>.jpg  (grid scan -> satu-satunya salinan lokal)
+    (b) tmp_images/<filename>                       (kompat file flat lama)
+    (c) unduh dari URL publik VPS                   ('Input Images' database/upload)."""
+    t = t or {}
+    fname = t.get("filename")
+    gx, gy = t.get("gridX"), t.get("gridY")
+
+    if session and gx is not None and gy is not None:
+        try:
+            p = os.path.join(LOCAL_TMP_DIR, _safe_session(session),
+                             f"tile_r{int(gy)}_c{int(gx)}.jpg")
+            if os.path.exists(p):
+                return p
+        except (TypeError, ValueError):
+            pass
+
     if fname:
         local = os.path.join(LOCAL_TMP_DIR, fname)
         if os.path.exists(local):
             return local
-    url = (t or {}).get("url")
+    url = t.get("url")
     if url and requests is not None:
         if url.startswith("/"):
             url = VPS_STATIC_HOST + url
@@ -87,7 +122,7 @@ def _resolve_tile_source(t):
     return None
 
 
-def _stage_tiles_from_coords(tiles, stage_dir):
+def _stage_tiles_from_coords(tiles, stage_dir, session=None):
     """Stage tile memakai info eksplisit dari backend. Prioritas nama:
     'tile_r<row>_c<col>.jpg' (indeks grid) kalau ada gridX/gridY, kalau tidak
     'Focused_<x>_<y>.jpg' (koordinat mm). Keduanya dikenali SP_LG.load_image()."""
@@ -109,7 +144,7 @@ def _stage_tiles_from_coords(tiles, stage_dir):
             print(f"[BRIDGE AI WARNING] Tile tanpa posisi grid/koordinat: {t}")
             continue
 
-        src = _resolve_tile_source(t)
+        src = _resolve_tile_source(t, session=session)
         if not src:
             print(f"[BRIDGE AI WARNING] Sumber tile tidak tersedia: {t.get('filename')}")
             continue
@@ -143,7 +178,7 @@ def _stage_tiles_for_sp_lg(image_paths, stage_dir):
     return staged
 
 
-def _run_colony_count(input_path, output_dir):
+def _run_colony_count(input_path, output_dir, conf=0.25):
     """
     Jalankan model YOLO segmentation nyata (best_Seg_1280_int8.engine) lewat
     colony_counting.count_colonies(), lalu salin hasil anotasinya ke nama
@@ -152,7 +187,7 @@ def _run_colony_count(input_path, output_dir):
     Return (legacy_filename, count) -- meniru signature colony_counter lama.
     """
     result = count_colonies(input_path, YOLO_SEG_MODEL, output_dir=output_dir,
-                            task="segment", save_annotated=True)
+                            conf=conf, task="segment", save_annotated=True)
 
     legacy_filename = "yolo_" + os.path.basename(input_path)
     legacy_path = os.path.join(output_dir, legacy_filename)
@@ -162,43 +197,184 @@ def _run_colony_count(input_path, output_dir):
     return legacy_filename, result["count"]
 
 
+# =====================================================================
+# Image Analysis (CV_*) — SEMUA dieksekusi DI JETSON, hasil dikirim balik
+# ke VPS sebagai base64 lewat WebSocket (event CV_RESULT / CV_FAILED).
+# Tidak ada ketergantungan filesystem bersama dengan VPS.
+# =====================================================================
+_CV_IN_DIR = os.path.join(LOCAL_TMP_DIR, "_cv_in")
+
+
+def _fetch_analysis_input(filename, image_b64=None):
+    """Path lokal ke gambar input analisis di Jetson. Urutan:
+    (a) base64 dari payload perintah, (b) sudah ada di tmp_images,
+    (c) unduh dari VPS <host>/static/uploads/<filename>."""
+    if not filename:
+        return None
+    base = os.path.basename(str(filename))
+
+    if image_b64:
+        try:
+            os.makedirs(_CV_IN_DIR, exist_ok=True)
+            payload = image_b64.split(",", 1)[1] if "," in image_b64 else image_b64
+            dst = os.path.join(_CV_IN_DIR, base)
+            with open(dst, "wb") as f:
+                f.write(base64.b64decode(payload))
+            return dst
+        except Exception as e:
+            print(f"[BRIDGE CV] Gagal decode base64 input: {e}")
+
+    local = os.path.join(LOCAL_TMP_DIR, base)
+    if os.path.exists(local):
+        return local
+
+    if requests is not None:
+        url = f"{VPS_STATIC_HOST}/static/uploads/{filename}"
+        try:
+            os.makedirs(_CV_IN_DIR, exist_ok=True)
+            dst = os.path.join(_CV_IN_DIR, base)
+            with requests.get(url, stream=True, timeout=30) as rq:
+                if rq.status_code == 200:
+                    with open(dst, "wb") as f:
+                        for chunk in rq.iter_content(8192):
+                            if chunk:
+                                f.write(chunk)
+                    return dst
+                print(f"[BRIDGE CV] Unduh input gagal ({rq.status_code}): {url}")
+        except Exception as e:
+            print(f"[BRIDGE CV] Unduh input error: {e}")
+    return None
+
+
+async def _send_cv_result(websocket, ws_lock, out_path, report_name, extra=None):
+    with open(out_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    msg = {
+        "event": "CV_RESULT", "status": "SUCCESS",
+        "filename": report_name,
+        "image_data": f"data:image/jpeg;base64,{b64}",
+    }
+    if extra:
+        msg.update(extra)
+    async with ws_lock:
+        await websocket.send(json.dumps(msg))
+
+
+async def _send_cv_failed(websocket, ws_lock, tool, detail, output_name=None):
+    print(f"[BRIDGE CV ERROR] {tool}: {detail}")
+    async with ws_lock:
+        await websocket.send(json.dumps({
+            "event": "CV_FAILED", "status": "ERROR", "tool": tool,
+            "detail": detail, "output_name": output_name,
+        }))
+
+
+# tool CV_* -> (method callable pada classic_cv_editor, apakah mengembalikan (name, extra))
+_CV_CLASSIC = {
+    "CV_THRESHOLD":   ("apply_adaptive_threshold", None),
+    "CV_CONTOUR":     ("extract_and_draw_contours", None),
+    "CV_SOBEL":       ("apply_sobel_edge", None),
+    "CV_ROI":         ("auto_roi_crop", None),
+    "CV_CALIBRATE":   ("draw_scale_calibration", None),
+    "CV_COLOR_SPLIT": ("split_color_channels", None),
+    "CV_MORPHOLOGY":  ("calculate_morphology", "stats"),
+}
+
+
 async def handle_ai_action(action: str, data: dict, websocket, ws_lock):
     """Router untuk instruksi Computer Vision dan AI"""
     if action == "START_STITCHING":
         model_key = (data.get("model") or "sp_lg_tensorrt").lower()
-        backend = _STITCH_BACKEND.get(model_key, "tensorrt")
-        print(f"[BRIDGE AI] Menjalankan Tile Stitching SP_LG (model={model_key}, backend={backend})...")
+        if model_key not in _STITCH_SCRIPTS:
+            model_key = "sp_lg_tensorrt"
+        session = data.get("session")
+        print(f"[BRIDGE AI] Tile Stitching (model={model_key}, sesi={session})...")
 
-        stage_dir = os.path.join(LOCAL_TMP_DIR, "_sp_lg_stage")
+        async def emit_progress(pct, label):
+            try:
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "STITCH_PROGRESS", "pct": int(pct), "phase": label,
+                    }))
+            except Exception:
+                pass
+
+        await emit_progress(5, "Menyiapkan tile")
 
         tiles = data.get("tiles")
-        if tiles:
-            # Jalur BARU: posisi grid / koordinat dikirim eksplisit oleh backend.
-            staged = _stage_tiles_from_coords(tiles, stage_dir)
-        else:
-            # Jalur LAMA: koordinat dibaca dari nama file '..._X<x>_Y<y>.jpg'.
-            target_images = data.get("images", [])
-            if target_images:
-                captured_tiles = [os.path.join(LOCAL_TMP_DIR, img) for img in target_images]
+        stage_dir = None
+        staged = 0
+
+        # 1) Folder sesi terisolasi yang sudah berisi 'tile_r<row>_c<col>.jpg'.
+        if session:
+            sess_dir = os.path.join(LOCAL_TMP_DIR, _safe_session(session))
+            grid_files = glob.glob(os.path.join(sess_dir, "tile_r*_c*.jpg"))
+            if os.path.isdir(sess_dir) and len(grid_files) >= 2:
+                stage_dir = sess_dir
+                staged = len(grid_files)
+                print(f"[BRIDGE AI] Memakai folder sesi ({staged} tile): {sess_dir}")
+
+        # 2) Fallback: stage dari daftar 'tiles' ke folder staging PER-SESI.
+        if stage_dir is None:
+            stage_dir = os.path.join(LOCAL_TMP_DIR, "_stage_" + _safe_session(session or "adhoc"))
+            if tiles:
+                staged = _stage_tiles_from_coords(tiles, stage_dir, session=session)
+            elif data.get("images"):
+                captured_tiles = [os.path.join(LOCAL_TMP_DIR, img) for img in data["images"]]
+                staged = _stage_tiles_for_sp_lg(captured_tiles, stage_dir)
             else:
-                captured_tiles = sorted(glob.glob(os.path.join(LOCAL_TMP_DIR, "IMG_*.jpg")))
-            staged = _stage_tiles_for_sp_lg(captured_tiles, stage_dir)
+                print("[BRIDGE AI ERROR] Tidak ada tile yang ditentukan (tiles/images kosong).")
+                staged = 0
 
         output_file = None
         fail_detail = ""
+
         if staged >= 2:
+            script, result_name = _STITCH_SCRIPTS[model_key]
+            script_path = os.path.join(_QM_DIR, script)
+            expected = os.path.join(stage_dir, result_name)
+            if os.path.exists(expected):
+                os.remove(expected)
+
+            await emit_progress(12, f"Menjalankan {model_key}")
             try:
-                cfg = {**SP_LG_CONFIG, "backend": backend}
-                result = run_pipeline(cfg=cfg, folder_path=stage_dir)
-                output_file = result["save_path"]
+                env = dict(os.environ)
+                env["PYTHONPATH"] = os.pathsep.join(
+                    [_REPO_ROOT, _QM_DIR, env.get("PYTHONPATH", "")])
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, script_path, "--path", stage_dir,
+                    cwd=_QM_DIR, env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                seen = set()
+                while True:
+                    raw = await proc.stdout.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip()
+                    if line:
+                        print(f"[STITCH:{model_key}] {line}")
+                    for key, pct, label in _STITCH_MILESTONES:
+                        if key in line and key not in seen:
+                            seen.add(key)
+                            await emit_progress(pct, label)
+                rc = await proc.wait()
+                if rc == 0 and os.path.exists(expected):
+                    output_file = expected
+                else:
+                    fail_detail = (f"Pipeline {model_key} berakhir (exit {rc}) tanpa "
+                                   f"menghasilkan mosaik — kemungkinan overlap antar-tile "
+                                   f"terlalu kecil.")
             except Exception as e:
-                fail_detail = f"Pipeline SP_LG gagal: {e}"
+                fail_detail = f"Gagal menjalankan {model_key}: {e}"
                 print(f"[BRIDGE AI ERROR] {fail_detail}")
         else:
             fail_detail = f"Tile dengan posisi valid kurang dari 2 (staged={staged})."
             print(f"[BRIDGE AI ERROR] {fail_detail}")
 
         if output_file and os.path.exists(output_file):
+            await emit_progress(98, "Mengunggah hasil")
             local_output = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
             shutil.copy2(output_file, local_output)
 
@@ -213,7 +389,7 @@ async def handle_ai_action(action: str, data: dict, websocket, ws_lock):
                     "filename": "stitched_ta_output.jpg"
                 }))
         else:
-            print("[BRIDGE ERROR] Stitching gagal.")
+            print(f"[BRIDGE ERROR] Stitching gagal: {fail_detail}")
             async with ws_lock:
                 await websocket.send(json.dumps({
                     "event": "STITCHING_FAILED", "status": "ERROR",
@@ -248,136 +424,83 @@ async def handle_ai_action(action: str, data: dict, websocket, ws_lock):
         edit_type = data.get("type", "")
         target_img = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
         print(f"[BRIDGE CV] Menerapkan filter edit klasik: {edit_type}")
+        params = data.get("params") or {}
 
+        res_file = None
         if edit_type == "THRESHOLD":
-            res_file = classic_cv_editor.apply_adaptive_threshold(target_img)
+            res_file = classic_cv_editor.apply_adaptive_threshold(target_img, params)
         elif edit_type == "BRIGHTNESS":
-            b_val = data.get("brightness", 0)
-            c_val = data.get("contrast", 0)
-            res_file = classic_cv_editor.apply_brightness_contrast(target_img, b_val, c_val)
+            res_file = classic_cv_editor.apply_brightness_contrast(
+                target_img, brightness=data.get("brightness", 0), contrast=data.get("contrast", 0))
 
-        local_edited_path = os.path.join(LOCAL_TMP_DIR, res_file)
-        with open(local_edited_path, "rb") as img_file:
-            encoded_edited = base64.b64encode(img_file.read()).decode('utf-8')
+        if not res_file:
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "EDIT_FAILED", "status": "ERROR",
+                    "detail": f"APPLY_IMAGE_EDIT: tipe '{edit_type}' tak dikenal atau gambar tidak ada.",
+                }))
+        else:
+            local_edited_path = os.path.join(classic_cv_editor.output_dir, res_file)
+            with open(local_edited_path, "rb") as img_file:
+                encoded_edited = base64.b64encode(img_file.read()).decode('utf-8')
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "EDIT_COMPLETE",
+                    "status": "SUCCESS",
+                    "image_data": f"data:image/jpeg;base64,{encoded_edited}",
+                    "filename": res_file
+                }))
 
-        async with ws_lock:
-            await websocket.send(json.dumps({
-                "event": "EDIT_COMPLETE",
-                "status": "SUCCESS",
-                "image_data": f"data:image/jpeg;base64,{encoded_edited}",
-                "filename": res_file
-            }))
-
-    elif action == "CV_COLONY_COUNT":
+    elif action in ("CV_COLONY_COUNT", "CV_THRESHOLD", "CV_CONTOUR", "CV_MORPHOLOGY",
+                    "CV_SOBEL", "CV_ROI", "CV_CALIBRATE", "CV_COLOR_SPLIT"):
+        tool = action
         filename = data.get("filename")
-        print("\n" + "="*60)
-        print(f"[BRIDGE AI] 🧬 FITUR AKTIF: YOLO Segmentation Colony Counter")
-        print(f"[BRIDGE AI] ⏳ Memuat model TensorRT best_Seg_1280_int8...")
-        print(f"[BRIDGE AI] 🔍 Menganalisis citra: {filename}")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            output_dir = os.path.dirname(input_path)
-            try:
-                result_img, count_result = _run_colony_count(input_path, output_dir)
-            except Exception as e:
-                print(f"[BRIDGE AI ERROR] Colony counting gagal: {e}")
+        params = data.get("params") or {}
+        # Nama file hasil yang HARUS dilaporkan balik ke VPS (backend menunggu
+        # file bernama persis ini di static/uploads). Disuplai backend.
+        report_name = data.get("output_name")
+        print(f"[BRIDGE CV] {tool} pada '{filename}' (params={params}) — DIEKSEKUSI DI JETSON")
+
+        src = _fetch_analysis_input(filename, data.get("image_b64"))
+        if not src or not os.path.exists(src):
+            await _send_cv_failed(websocket, ws_lock, tool,
+                                  f"Gambar input tidak tersedia di Edge: {filename}", report_name)
+            return
+
+        try:
+            out_dir = classic_cv_editor.output_dir
+            extra = None
+
+            if tool == "CV_COLONY_COUNT":
+                try:
+                    conf = float(params.get("conf", 0.25))
+                except (TypeError, ValueError):
+                    conf = 0.25
+                out_name, count = await asyncio.to_thread(_run_colony_count, src, out_dir, conf)
+                extra = {"colonies": int(count)}
+                print(f"[BRIDGE CV] YOLO colony count = {count} (conf={conf})")
             else:
-                json_output = os.path.join(output_dir, result_img.replace('.jpg', '.json').replace('.png', '.json'))
-                with open(json_output, 'w') as f:
-                    json.dump({"colony_count": count_result}, f)
-                print(f"[BRIDGE AI] ✅ Selesai. Hasil deteksi: {count_result} koloni.")
-                print("="*60 + "\n")
+                method_name, extra_key = _CV_CLASSIC[tool]
+                method = getattr(classic_cv_editor, method_name)
+                result = await asyncio.to_thread(method, src, params)
+                if extra_key == "stats":
+                    out_name, stats = result
+                    extra = {"stats": stats}
+                else:
+                    out_name = result
 
-    elif action == "CV_THRESHOLD":
-        filename = data.get("filename")
-        print("\n" + "-"*50)
-        print(f"[BRIDGE CV] 🌗 FITUR AKTIF: Adaptive Threshold")
-        print(f"[BRIDGE CV] 🧮 Menghitung nilai biner pada {filename}...")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            res_file = classic_cv_editor.apply_adaptive_threshold(input_path)
-            print(f"[BRIDGE CV] ✅ Binarisasi Selesai. Output: {res_file}")
-            print("-" * 50 + "\n")
-        else:
-            print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
+            if not out_name:
+                await _send_cv_failed(websocket, ws_lock, tool,
+                                      "Proses CV tidak menghasilkan output (gambar tak terbaca?).", report_name)
+                return
+            out_path = os.path.join(out_dir, out_name)
+            if not os.path.exists(out_path):
+                await _send_cv_failed(websocket, ws_lock, tool, f"File output hilang: {out_name}", report_name)
+                return
 
-    elif action == "CV_CONTOUR":
-        filename = data.get("filename")
-        print("\n" + "-"*50)
-        print(f"[BRIDGE CV] 🦠 FITUR AKTIF: Ekstraksi Kontur")
-        print(f"[BRIDGE CV] 📐 Mencari dinding sel geometri pada {filename}...")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            res_file = classic_cv_editor.extract_and_draw_contours(input_path)
-            print(f"[BRIDGE CV] ✅ Penggambaran Kontur Selesai. Output: {res_file}")
-            print("-" * 50 + "\n")
-        else:
-            print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
-
-    elif action == "CV_MORPHOLOGY":
-        filename = data.get("filename")
-        print("\n" + "-"*50)
-        print(f"[BRIDGE CV] 📏 FITUR AKTIF: Kalkulasi Morfologi")
-        print(f"[BRIDGE CV] 📊 Mengekstrak area dan keliling dari {filename}...")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            res_file, stats = classic_cv_editor.calculate_morphology(input_path)
-            json_output = os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", res_file.replace('.jpg', '.json').replace('.png', '.json'))
-            with open(json_output, 'w') as f:
-                json.dump(stats, f)
-            print(f"[BRIDGE CV] ✅ Kalkulasi Morfologi Selesai. Output: {res_file}")
-            print("-" * 50 + "\n")
-        else:
-            print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
-
-    elif action == "CV_SOBEL":
-        filename = data.get("filename")
-        print("\n" + "-"*50)
-        print(f"[BRIDGE CV] 🔪 FITUR AKTIF: Sobel Edge Detection")
-        print(f"[BRIDGE CV] 🧮 Mengekstrak garis tepi konvolusi pada {filename}...")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            res_file = classic_cv_editor.apply_sobel_edge(input_path)
-            print(f"[BRIDGE CV] ✅ Deteksi Tepi Selesai. Output: {res_file}")
-            print("-" * 50 + "\n")
-        else:
-            print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
-
-    elif action == "CV_ROI":
-        filename = data.get("filename")
-        print("\n" + "-"*50)
-        print(f"[BRIDGE CV] ✂️ FITUR AKTIF: ROI Selection")
-        print(f"[BRIDGE CV] 📍 Memotong area spesifik citra {filename}...")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            res_file = classic_cv_editor.auto_roi_crop(input_path)
-            print(f"[BRIDGE CV] ✅ Pemotongan Selesai. Output: {res_file}")
-            print("-" * 50 + "\n")
-        else:
-            print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
-
-    elif action == "CV_CALIBRATE":
-        filename = data.get("filename")
-        print("\n" + "-"*50)
-        print(f"[BRIDGE CV] 🔬 FITUR AKTIF: Scale Calibration")
-        print(f"[BRIDGE CV] 📐 Menerapkan matriks kalibrasi lensa objektif pada {filename}...")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            res_file = classic_cv_editor.draw_scale_calibration(input_path)
-            print(f"[BRIDGE CV] ✅ Kalibrasi Selesai. Output: {res_file}")
-            print("-" * 50 + "\n")
-        else:
-            print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
-
-    elif action == "CV_COLOR_SPLIT":
-        filename = data.get("filename")
-        print("\n" + "-"*50)
-        print(f"[BRIDGE CV] 🎨 FITUR AKTIF: Color Channel Split")
-        print(f"[BRIDGE CV] 🧪 Memisahkan warna stain RGB spesifik pada {filename}...")
-        input_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../Software/backend/static/uploads", filename))
-        if os.path.exists(input_path):
-            res_file = classic_cv_editor.split_color_channels(input_path)
-            print(f"[BRIDGE CV] ✅ Pemisahan Warna Selesai. Output: {res_file}")
-            print("-" * 50 + "\n")
-        else:
-            print(f"[BRIDGE CV ERROR] File tidak ditemukan di: {input_path}")
+            await _send_cv_result(websocket, ws_lock, out_path, report_name or out_name, extra)
+            print(f"[BRIDGE CV] ✅ {tool} selesai -> dilaporkan sbg {report_name or out_name}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            await _send_cv_failed(websocket, ws_lock, tool, f"{type(e).__name__}: {e}", report_name)

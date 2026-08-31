@@ -82,9 +82,18 @@ class IMX477CameraCore:
             return False
 
     def _gst_command(self):
+        # Injeksi exposure & gain dari pengaturan kamera (shutter µs, ISO).
+        src = ["nvarguscamerasrc", f"sensor-id={self.sensor_id}"]
+        if self.shutter_speed:
+            ns = int(float(self.shutter_speed)) * 1000  # µs -> ns
+            src.append(f"exposuretimerange={ns} {ns}")
+            src.append("aelock=true")
+        if self.iso:
+            g = max(1.0, min(22.0, float(self.iso) / 100.0))   # ISO ~-> analog gain
+            src.append(f"gainrange={g:.2f} {g:.2f}")
+            src.append("aelock=true")
         return [
-            "gst-launch-1.0", "-q",
-            "nvarguscamerasrc", f"sensor-id={self.sensor_id}", "!",
+            "gst-launch-1.0", "-q", *src, "!",
             "video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=NV12", "!",
             "queue", "max-size-buffers=2", "leaky=2", "!",
             "nvvidconv", "!",
@@ -280,10 +289,35 @@ class IMX477CameraCore:
             return self.jpeg_frame
 
     def apply_settings(self, shutter_speed=None, iso=None):
-        self.shutter_speed = shutter_speed if shutter_speed is not None else self.shutter_speed
-        self.iso = iso if iso is not None else self.iso
-        print("[CORE CAMERA WARNING] Pengaturan on-the-fly tidak didukung di mode subprocess Jetson.")
-        return False
+        if shutter_speed is not None:
+            self.shutter_speed = int(float(shutter_speed))
+        if iso is not None:
+            self.iso = int(float(iso))
+
+        # Windows/OpenCV: coba set properti langsung.
+        if self.cap is not None:
+            try:
+                if self.shutter_speed:
+                    self.cap.set(cv2.CAP_PROP_EXPOSURE, self.shutter_speed)
+                if self.iso:
+                    self.cap.set(cv2.CAP_PROP_GAIN, self.iso)
+            except Exception:
+                pass
+            return True
+
+        # Jetson/GStreamer: props exposure/gain hanya bisa saat pipeline dibuat,
+        # jadi RESTART pipeline sekali dengan _gst_command() yang sudah memuat
+        # nilai baru. Kalau belum streaming, cukup simpan (berlaku saat dinyalakan).
+        if self.started and self.proc is not None:
+            print(f"[CORE CAMERA] Menerapkan shutter={self.shutter_speed}µs iso={self.iso} (restart pipeline)...")
+            try:
+                self.close()
+                time.sleep(0.6)
+                return self.open()
+            except Exception as e:
+                print(f"[CORE CAMERA ERROR] Gagal restart untuk apply settings: {e}")
+                return False
+        return True
 
     def capture_to_bytes(self, quality=75):
         """Mengembalikan JPEG bytes untuk kompatibilitas backward."""

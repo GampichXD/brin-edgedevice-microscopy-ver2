@@ -3,6 +3,7 @@ import json
 import websockets
 import base64
 import os
+import sys
 import cv2
 import time
 import psutil
@@ -40,9 +41,31 @@ async def receive_handler(websocket):
             data = json.loads(message)
             action = data.get("action", "").upper()
             
-            if action in ["MOVE_MOTOR", "HOMING", "UNLOCK", "APPLY_CNC_SETTINGS"]:
+            if action == "RESTART_EDGE":
+                print("[BRIDGE] ♻️  Perintah ADMIN: restart layanan Edge (os.execv).")
+                try:
+                    async with ws_lock:
+                        await websocket.send(json.dumps({
+                            "event": "EDGE_RESTARTING", "status": "OK"
+                        }))
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+                try:
+                    camera_core.close()
+                except Exception:
+                    pass
+                try:
+                    motor_core.close()
+                except Exception:
+                    pass
+                main_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "main.py"))
+                print(f"[BRIDGE] Menjalankan ulang: {sys.executable} {main_py}")
+                os.execv(sys.executable, [sys.executable, main_py])
+
+            if action in ["MOVE_MOTOR", "HOMING", "UNLOCK", "SET_POSITION", "APPLY_CNC_SETTINGS", "APPLY_SOFT_LIMITS"]:
                 await handle_motor_action(action, data, websocket, ws_lock)
-            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "PURGE_CACHE", "PURGE_ALL_DATASETS"]:
+            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "PURGE_CACHE", "PURGE_ALL_DATASETS", "PURGE_DATASET_FOLDER", "PURGE_DATASET_FILES"]:
                 await handle_camera_action(action, data, websocket, ws_lock, state)
             elif action in ["START_STITCHING", "START_DL_COUNT", "APPLY_IMAGE_EDIT", "CV_COLONY_COUNT", "CV_THRESHOLD", "CV_CONTOUR", "CV_MORPHOLOGY", "CV_SOBEL", "CV_ROI", "CV_CALIBRATE", "CV_COLOR_SPLIT"]:
                 await handle_ai_action(action, data, websocket, ws_lock)
@@ -78,14 +101,32 @@ async def send_stream_task(websocket, state):
                     if frame is not None:
                         if state["recording_pending_init"]:
                             h, w = frame.shape[:2]
-                            fourcc = cv2.VideoWriter_fourcc(*'vp09')  # VP9 - browser native (WebM)
-                            state["video_writer"] = cv2.VideoWriter(state["recording_filepath"], fourcc, float(state["target_fps"]), (w, h))
-                            if state["video_writer"].isOpened():
-                                state["recording_pending_init"] = False
-                                print(f"[BRIDGE] VideoWriter berhasil diinisialisasi: {state['recording_filepath']} ({w}x{h} @ {state['target_fps']}fps)")
-                            else:
-                                print(f"[BRIDGE ERROR] VideoWriter gagal dibuka! Path: {state['recording_filepath']}")
-                                state["video_writer"] = None
+                            fps_w = max(1.0, float(state["target_fps"]))
+                            path = state["recording_filepath"]
+                            # Coba beberapa codec — 'vp09' sering TIDAK tersedia di
+                            # OpenCV Jetson. mp4v (.mp4) & MJPG (.avi) hampir selalu ada.
+                            attempts = [
+                                (path.rsplit(".", 1)[0] + ".mp4", "mp4v"),
+                                (path.rsplit(".", 1)[0] + ".avi", "MJPG"),
+                                (path, "vp09"),
+                            ]
+                            vw = None
+                            for cand_path, cc in attempts:
+                                try:
+                                    test = cv2.VideoWriter(cand_path, cv2.VideoWriter_fourcc(*cc), fps_w, (w, h))
+                                    if test.isOpened():
+                                        vw = test
+                                        state["recording_filepath"] = cand_path
+                                        state["recording_final_filepath"] = state["recording_final_filepath"].rsplit(".", 1)[0] + "." + cand_path.rsplit(".", 1)[1]
+                                        print(f"[BRIDGE] VideoWriter OK ({cc}): {cand_path} ({w}x{h} @ {fps_w}fps)")
+                                        break
+                                    test.release()
+                                except Exception as e:
+                                    print(f"[BRIDGE] VideoWriter {cc} gagal: {e}")
+                            state["video_writer"] = vw
+                            state["recording_pending_init"] = False
+                            if vw is None:
+                                print("[BRIDGE ERROR] Semua codec VideoWriter gagal — rekaman tidak akan tersimpan.")
                         if state["video_writer"] is not None:
                             state["video_writer"].write(frame)
 
@@ -134,7 +175,10 @@ async def telemetry_sender(websocket):
                         "X": status_data["X"],
                         "Y": status_data["Y"],
                         "Z": status_data["Z"]
-                    }
+                    },
+                    "soft_limits_enabled": motor_core.soft_limits_enabled,
+                    "soft_limits": motor_core.soft_limits,
+                    "at_limit": motor_core.limit_flags(),
                 }))
         except Exception:
             break

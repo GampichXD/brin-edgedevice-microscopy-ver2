@@ -21,6 +21,9 @@ class GRBLMotorCore:
             "acceleration": 10.0,
             "settle_time": 0,
         }
+        # Soft limit switch: batas gerak per sumbu (mm). None = tak dibatasi.
+        self.soft_limits_enabled = False
+        self.soft_limits = {"X": [None, None], "Y": [None, None], "Z": [None, None]}
         self.last_axis_direction = {"X": None, "Y": None, "Z": None}
         self.position_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_position.json")
         self.last_status = "Idle"
@@ -165,6 +168,19 @@ class GRBLMotorCore:
         elif clean_cmd == "G90":
             self.is_relative_mode = False
 
+        # ── SOFT LIMIT untuk gerak ABSOLUT (G0/G1 X.. Y.. Z..) ──
+        # Potong tiap koordinat target agar tak melewati batas sebelum dikirim.
+        if (self.soft_limits_enabled and not self.is_relative_mode
+                and clean_cmd.upper().startswith(("G0 ", "G1 "))):
+            def _clamp_match(mobj):
+                ax = mobj.group(1).upper()
+                v, hit = self._clamp_axis(ax, float(mobj.group(2)))
+                if hit != 0:
+                    print(f"[CORE MOTOR] Soft limit {('-' if hit < 0 else '+')}{ax} "
+                          f"— target absolut dipotong ke {v:.3f}")
+                return f"{ax}{v:.3f}"
+            clean_cmd = re.sub(r"([XYZxyz])\s*(-?[\d.]+)", _clamp_match, clean_cmd)
+
         if self.is_mock_mode:
             print(f"[MOCK MOTOR] Menembak: {clean_cmd} -> Balasan: ok")
             self._track_position_from_gcode(clean_cmd)
@@ -218,6 +234,46 @@ class GRBLMotorCore:
             print(f"[CORE MOTOR ERROR] Gagal melakukan operasi I/O Serial: {e}")
             return f"ERROR: {e}"
 
+    def set_soft_limits(self, enabled=None, limits=None, **kwargs):
+        """limits: {"X":[min,max], "Y":[...], "Z":[...]}. Nilai None/"" -> tak dibatasi."""
+        if enabled is not None:
+            self.soft_limits_enabled = bool(enabled)
+        src = limits or kwargs
+        for ax in ("X", "Y", "Z"):
+            key_lo = f"{ax.lower()}_min"
+            key_hi = f"{ax.lower()}_max"
+            pair = src.get(ax) if isinstance(src, dict) and ax in src else None
+            lo = pair[0] if pair else src.get(key_lo)
+            hi = pair[1] if pair else src.get(key_hi)
+            self.soft_limits[ax] = [
+                (float(lo) if lo not in (None, "", "null") else None),
+                (float(hi) if hi not in (None, "", "null") else None),
+            ]
+        print(f"[CORE MOTOR] Soft limits (enabled={self.soft_limits_enabled}): {self.soft_limits}")
+        return "ok"
+
+    def _clamp_axis(self, axis, value):
+        """Kembalikan (nilai_terbatas, kena_batas: -1 min / +1 max / 0 tidak)."""
+        if not self.soft_limits_enabled:
+            return value, 0
+        lo, hi = self.soft_limits.get(axis, [None, None])
+        if lo is not None and value < lo:
+            return lo, -1
+        if hi is not None and value > hi:
+            return hi, +1
+        return value, 0
+
+    def limit_flags(self):
+        """Flag sumbu yang sedang menyentuh batas (untuk telemetri UI)."""
+        flags = {}
+        if self.soft_limits_enabled:
+            for ax in ("X", "Y", "Z"):
+                lo, hi = self.soft_limits.get(ax, [None, None])
+                p = self.last_known_pos.get(ax, 0.0)
+                flags[f"-{ax}"] = lo is not None and p <= lo + 1e-6
+                flags[f"+{ax}"] = hi is not None and p >= hi - 1e-6
+        return flags
+
     def apply_motion_settings(self, feed_rate=None, backlash=None, acceleration=None, settle_time=None):
         if feed_rate is not None:
             self.motion_settings["feed_rate"] = float(feed_rate)
@@ -232,10 +288,14 @@ class GRBLMotorCore:
             print(f"[MOCK MOTOR] Motion settings updated: {self.motion_settings}")
             return "ok"
 
+        acc = self.motion_settings['acceleration']
+        fr = self.motion_settings['feed_rate']
         responses = [
-            self.send_command(f"$120={self.motion_settings['acceleration']}"),
-            self.send_command(f"$121={self.motion_settings['acceleration']}"),
-            self.send_command(f"$122={self.motion_settings['acceleration']}"),
+            self.send_command(f"$120={acc}"), self.send_command(f"$121={acc}"),
+            self.send_command(f"$122={acc}"),
+            # $110-112 = max rate (mm/min) -> feed rate benar-benar sampai ke GRBL
+            self.send_command(f"$110={fr}"), self.send_command(f"$111={fr}"),
+            self.send_command(f"$112={fr}"),
         ]
         print(f"[CORE MOTOR] Motion settings updated: {self.motion_settings}")
         return " | ".join(responses)
@@ -255,6 +315,17 @@ class GRBLMotorCore:
 
         feedrate_value = feedrate if feedrate is not None else self.motion_settings.get("feed_rate", 250.0)
         self.last_axis_direction[axis] = direction
+
+        # ── SOFT LIMIT: potong pergerakan agar tidak melewati batas ──
+        cur = float(self.last_known_pos.get(axis, 0.0))
+        target = cur + effective_delta
+        clamped_target, hit = self._clamp_axis(axis, target)
+        if hit != 0:
+            effective_delta = clamped_target - cur
+            print(f"[CORE MOTOR] Soft limit {('-' if hit < 0 else '+')}{axis} — "
+                  f"gerak dipotong ke {clamped_target:.3f}")
+            if abs(effective_delta) < 1e-4:
+                return f"BLOCKED: batas {('-' if hit < 0 else '+')}{axis} tercapai"
 
         # last_known_pos + persist ke JSON diurus oleh send_command() di bawah,
         # lewat logika modal G91 (berlaku untuk mode mock maupun serial fisik).
@@ -364,6 +435,20 @@ class GRBLMotorCore:
         # send_command() akan meng-update last_known_pos + persist ke JSON.
         gcode_str = " ".join(gcode_parts)
         return self.send_command(gcode_str)
+
+    def set_position(self, x=0.0, y=0.0, z=0.0):
+        """ADMIN: tulis ulang koordinat kerja TANPA menggerakkan motor.
+        Kirim G92 ke GRBL (set work offset) lalu persist ke motor_position.json."""
+        self.last_known_pos = {"X": round(float(x), 3), "Y": round(float(y), 3), "Z": round(float(z), 3)}
+        self.is_relative_mode = False
+        if not self.is_mock_mode and self.ser is not None and self.ser.is_open:
+            self.send_command("G90")
+            self.send_command(
+                f"G92 X{self.last_known_pos['X']} Y{self.last_known_pos['Y']} Z{self.last_known_pos['Z']}"
+            )
+        self._persist_if_changed()
+        print(f"[CORE MOTOR] Koordinat kerja di-set manual ke {self.last_known_pos}")
+        return "ok"
 
     def homing(self):
         self.last_known_pos = {"X": 0.0, "Y": 0.0, "Z": 0.0}

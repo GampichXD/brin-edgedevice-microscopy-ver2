@@ -171,7 +171,7 @@ DETECTOR_ACCEL = "CPU"
 CONFIG = {
     # --- General ---
     'resize_factor':        1.0,
-    'overlap_percentage':   0.4,
+    'overlap_percentage':   0.15,
     'canvas_padding':       50,
     'display_feather_distance':  30,  # soft feather for human viewing
     'analysis_feather_distance': 0,   # hard seam for analysis/training copy
@@ -202,11 +202,18 @@ CONFIG = {
     # --- RANSAC / homography ---
     'reproj_thresh':         4.0,  # px -- reprojection threshold for RANSAC
     'min_inlier_ratio':      0.15, # informational -- not used to reject pairs
+    'affine_scale_bounds': (0.5, 2.0),  # reject a pair's affine transform if its
+        # uniform scale falls outside this. Adjacent tiles come from the same
+        # fixed lens, so scale should sit near 1.0 -- RANSAC can still return a
+        # locally-consistent-looking but globally wrong transform on repetitive
+        # colony textures, and an unchecked scale gets multiplied across the BFS
+        # transform chain in calculate_all_transforms(), which is what blew
+        # calculate_optimal_canvas() up to a multi-terabyte allocation.
 
     # --- Device ---
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'debug': True,                 # Gate visualization plotting to avoid headless display hangs
-    'evaluate_metrics': True,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
+    'debug': False,                 # Gate visualization plotting to avoid headless display hangs
+    'evaluate_metrics': False,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
     'enable_benchmark': True,       # Toggle Performance & Memory Tracker benchmarking
     'use_amp': True,                # Toggle PyTorch Automatic Mixed Precision (AMP)
     'verbose_pair_metrics': False,   # Print PSNR/SSIM/NCC/RepError per pair (off = final summary only)
@@ -286,6 +293,13 @@ def load_image(folder_path, resize_factor=1.0):
     ---------------------------
     * ``Focused_<x>_<y>.jpg``    -- real-stage coordinates
     * ``tile_r<row>_c<col>.jpg`` -- grid indices (col->x, row->y)
+    * ``..._r<row>_c<col>_....jpg`` -- grid indices embedded anywhere in a
+      longer filename carrying extra metadata (e.g. capture timestamp, a
+      session hash, a save timestamp -- as in
+      ``IMG_20260831030147_6d37fc_r0_c0_20260831_030313.jpg`` from
+      Euglena_tiles/E_Coli_5x5). Matched with `.search()` rather than
+      `.match()` so surrounding text is ignored; only the r_/c_ indices
+      matter (col->x, row->y, same as the plain tile_r_c pattern).
 
     Returns
     -------
@@ -296,53 +310,60 @@ def load_image(folder_path, resize_factor=1.0):
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder '{folder_path}' tidak ditemukan")
 
-    focused_pat = re.compile(r'Focused_(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)\.jpg')
-    tile_pat    = re.compile(r'tile_r(\d+)_c(\d+)\.jpg')
+    focused_pattern  = re.compile(r'Focused_(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)\.jpg')
+    tile_pattern     = re.compile(r'tile_r(\d+)_c(\d+)\.jpg')
+    embedded_pattern = re.compile(r'_r(\d+)_c(\d+)_', re.IGNORECASE)
 
     image_data = {}
-    for fp in sorted(folder_path.glob('*.jpg')):
+    for file_path in folder_path.glob("*.jpg"):
+        name = file_path.name
         coords = None
-        m = focused_pat.match(fp.name)
+
+        m = focused_pattern.match(name)
         if m:
             coords = (float(m.group(1)), float(m.group(2)))
         else:
-            m = tile_pat.match(fp.name)
+            m = tile_pattern.match(name)
             if m:
-                coords = (float(m.group(2)), float(m.group(1)))  # col->x, row->y
+                coords = (float(m.group(2)), float(m.group(1)))   # col -> x, row -> y
+            else:
+                m = embedded_pattern.search(name)
+                if m:
+                    coords = (float(m.group(2)), float(m.group(1)))   # col -> x, row -> y
+
         if coords is None:
             continue
 
         try:
-            raw = cv2.imread(str(fp))
+            raw = cv2.imread(str(file_path))
             if raw is None:
-                print(f"[WARN] Gagal memuat (None): {fp.name}")
+                print(f"[WARN] Gagal memuat (None): {name}")
                 continue
             img_rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
             if resize_factor != 1.0:
-                h, w    = img_rgb.shape[:2]
-                img_rgb = cv2.resize(img_rgb,
-                                     (int(w * resize_factor), int(h * resize_factor)))
+                h, w = img_rgb.shape[:2]
+                img_rgb = cv2.resize(img_rgb, (int(w * resize_factor), int(h * resize_factor)))
             image_data[coords] = {
                 'image':      img_rgb,
                 'image_gray': cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY),
-                'filename':   fp.name,
+                'filename':   name,
             }
         except Exception as e:
-            print(f"[ERROR] Gagal memuat {fp.name}: {e}")
+            print(f"[ERROR] Gagal memuat {name}: {e}")
             traceback.print_exc()
 
     if not image_data:
         raise ValueError("Tidak ada gambar yang ditemukan di folder.")
 
-    xs = [c[0] for c in image_data]
-    ys = [c[1] for c in image_data]
-    unique_x = sorted(set(xs), reverse=True)
-    unique_y = sorted(set(ys))
+    x_coords = [c[0] for c in image_data]
+    y_coords = [c[1] for c in image_data]
+    unique_x = sorted(set(x_coords), reverse=True)
+    unique_y = sorted(set(y_coords))
 
     grid_info = {
         'dimensions': (len(unique_x), len(unique_y)),
-        'x_range':    (min(xs), max(xs)),
-        'y_range':    (min(ys), max(ys)),
+        'x_range':    (min(x_coords), max(x_coords)),
+        'y_range':    (min(y_coords), max(y_coords)),
         'unique_x':   unique_x,
         'unique_y':   unique_y,
     }
@@ -354,7 +375,7 @@ def load_image(folder_path, resize_factor=1.0):
 
 
 def _normalise_axes(axes, rows, cols):
-    """Guarantee axes is always list-of-lists regardless of grid shape."""
+    """Guarantee axes is always a list-of-lists, regardless of grid shape."""
     if rows == 1 and cols == 1:
         return [[axes]]
     if rows == 1:
@@ -367,21 +388,25 @@ def _normalise_axes(axes, rows, cols):
 def visualize_grid_preview(image_data, grid_info):
     if not image_data or not grid_info:
         raise ValueError("Data gambar tidak valid")
-    grid_w, grid_h   = grid_info['dimensions']
+
+    grid_w, grid_h = grid_info['dimensions']
     unique_x, unique_y = grid_info['unique_x'], grid_info['unique_y']
+
     fig, axes = plt.subplots(grid_h, grid_w, figsize=(grid_w * 3, grid_h * 3 + 1))
     axes = _normalise_axes(axes, grid_h, grid_w)
+
     for row in axes:
         for ax in row:
             ax.axis('off')
+
     for coords, data in image_data.items():
-        xi      = unique_x.index(coords[0])
-        yi      = unique_y.index(coords[1])
-        row_idx = grid_h - 1 - yi
-        axes[row_idx][xi].imshow(data['image'])
-        axes[row_idx][xi].set_title(f'({coords[0]},{coords[1]})', fontsize=16)
-    plt.suptitle(f'Image Grid: {grid_w}x{grid_h} | {len(image_data)} images loaded',
-                 fontsize=20)
+        x_idx   = unique_x.index(coords[0])
+        y_idx   = unique_y.index(coords[1])
+        row_idx = grid_h - 1 - y_idx
+        axes[row_idx][x_idx].imshow(data['image'])
+        axes[row_idx][x_idx].set_title(f'({coords[0]},{coords[1]})', fontsize=16)
+
+    plt.suptitle(f'Image Grid: {grid_w}x{grid_h} | {len(image_data)} images loaded', fontsize=20)
     plt.tight_layout()
     return fig
 
@@ -869,7 +894,7 @@ def visualize_lightglue_matches(image_data, match_result, top_n=3):
 # STEP 5 : Homography via RANSAC  (unchanged logic)
 # ============================================================
 
-def _homography_from_pts(pts1, pts2, reproj_thresh):
+def _homography_from_pts(pts1, pts2, reproj_thresh, scale_bounds=None):
     """Estimate transformation between point sets.
 
     Uses estimateAffinePartial2D (4 DOF: translation + rotation + uniform
@@ -888,6 +913,20 @@ def _homography_from_pts(pts1, pts2, reproj_thresh):
         ransacReprojThreshold=reproj_thresh
     )
     if H_affine is None:
+        return None
+    det = np.linalg.det(H_affine[:, :2])
+    # Reject a degenerate similarity transform (near-zero rotation/scale
+    # determinant) -- RANSAC can return one when inliers are few or
+    # near-collinear. A singular H is unusable for warpPerspective and
+    # would blow up np.linalg.inv() later in build_transformation_graph.
+    if abs(det) < 1e-6:
+        return None
+    # Reject an implausible uniform scale too (see CONFIG['affine_scale_bounds']):
+    # a stray scale of e.g. 50x compounds multiplicatively across the BFS
+    # transform chain and produces a canvas many orders of magnitude too big.
+    scale_lo, scale_hi = scale_bounds or (0.5, 2.0)
+    scale = np.sqrt(abs(det))
+    if not (scale_lo <= scale <= scale_hi):
         return None
     # Promote 2×3 affine matrix to 3×3 for warpPerspective compatibility
     H = np.eye(3, dtype=np.float64)
@@ -912,15 +951,16 @@ def calculate_homographies_batch(image_data, match_result, reproj_thresh=None):
         }}
     """
     reproj_thresh      = reproj_thresh or CONFIG['reproj_thresh']
+    scale_bounds       = CONFIG.get('affine_scale_bounds', (0.5, 2.0))
     homography_results = {}
     success = failed   = 0
 
     for (coord1, coord2), info in match_result.items():
         try:
             result = _homography_from_pts(info['pts1'], info['pts2'],
-                                          reproj_thresh)
+                                          reproj_thresh, scale_bounds)
             if result is None:
-                print(f"[SKIP] {coord1}<>{coord2}: <4 matches")
+                print(f"[SKIP] {coord1}<>{coord2}: <4 matches or degenerate/implausible transform")
                 failed += 1
                 continue
 
@@ -1046,8 +1086,17 @@ def build_transformation_graph(homography_results):
     graph = defaultdict(dict)
     for (c1, c2), info in homography_results.items():
         H = info['homography_matrix']
+        # _homography_from_pts() already rejects near-singular H via a
+        # determinant check, but guard the inverse anyway -- belt-and-braces
+        # against any degenerate matrix reaching here, since an uninvertible
+        # edge is unusable for the graph in either direction.
+        try:
+            H_inv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            print(f"[SKIP] {c1}<->{c2}: singular homography matrix, dropping edge")
+            continue
         graph[c1][c2] = H
-        graph[c2][c1] = np.linalg.inv(H)
+        graph[c2][c1] = H_inv
     return dict(graph)
 
 
@@ -1142,6 +1191,23 @@ def calculate_optimal_canvas(image_data, transforms):
     canvas_h = int(max_xy[1] - min_xy[1]) + 2 * pad
     offset_x = int(-min_xy[0]) + pad
     offset_y = int(-min_xy[1]) + pad
+
+    # Last-resort guard: a physically plausible canvas is bounded by grid
+    # size * tile size (every tile placed end-to-end, no overlap). Blowing
+    # past this means a bad homography (implausible scale/translation) got
+    # composed across the BFS transform chain -- fail loudly here with a
+    # diagnosable message instead of trying (and failing) to allocate a
+    # multi-terabyte canvas array.
+    max_tile_dim = max(max(d['image'].shape[:2]) for d in image_data.values())
+    sane_limit   = max_tile_dim * (len(image_data) + 2)
+    if canvas_w > sane_limit or canvas_h > sane_limit:
+        raise RuntimeError(
+            f"Canvas size {canvas_w}x{canvas_h} is implausible for {len(image_data)} "
+            f"tile(s) of max dimension {max_tile_dim}px (sane limit ~{sane_limit}px/side). "
+            f"This means at least one accepted homography is geometrically wrong -- check "
+            f"the per-pair inlier ratios/scale printed above, or tighten "
+            f"CONFIG['affine_scale_bounds']."
+        )
 
     print(f"   Canvas  : {canvas_w} x {canvas_h}  |  Offset: ({offset_x}, {offset_y})")
     return canvas_w, canvas_h, offset_x, offset_y
@@ -1720,7 +1786,7 @@ def extract_roi(image, roi_info, padding=5):
 if __name__ == '__main__':
     import argparse
     _parser = argparse.ArgumentParser(description="SIFT + LightGlue tile stitching")
-    _parser.add_argument('--path', default="/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/10x10_euglena_red",
+    _parser.add_argument('--path', default="/home/brin-microscope/Documents/Tugas-Akhir/Hardware/local_datasets/bfe9a132",
                          help="Folder of tile images to stitch")
     folder_path = _parser.parse_args().path
 
