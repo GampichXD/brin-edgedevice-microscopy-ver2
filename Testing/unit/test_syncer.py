@@ -53,3 +53,33 @@ def test_sync_disabled(monkeypatch, capsys):
     monkeypatch.setenv("SYNC_DISABLED", "1")
     vps_syncer.run_daemon()
     assert "dimatikan" in capsys.readouterr().out
+
+
+class _Up:
+    def __init__(self, code):
+        self.status_code = code
+
+
+def _dataset(tmp_path, name, n=3):
+    folder = tmp_path / name
+    folder.mkdir()
+    for i in range(n):
+        (folder / f"t{i}.jpg").write_text("x")
+    return folder
+
+
+def test_folder_kerja_berawalan_garis_bawah_dilewati(tmp_path, monkeypatch):
+    _dataset(tmp_path, "_stage_scaled_abc")
+    calls = []
+    monkeypatch.setattr(vps_syncer.requests, "post", lambda url, **k: calls.append(url) or _Up(200))
+    _run(tmp_path, monkeypatch, {"x": {"files": []}})
+    assert calls == []
+
+
+def test_folder_404_berhenti_setelah_satu_percobaan(tmp_path, monkeypatch):
+    folder = _dataset(tmp_path, "abc12345")
+    calls = []
+    monkeypatch.setattr(vps_syncer.requests, "post", lambda url, **k: calls.append(url) or _Up(404))
+    _run(tmp_path, monkeypatch, {"abc12345": {"files": []}})
+    assert len(calls) == 1
+    assert not list(folder.glob("*.synced"))

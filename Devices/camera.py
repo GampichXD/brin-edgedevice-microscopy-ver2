@@ -9,6 +9,7 @@ import atexit
 import re
 from datetime import datetime
 
+FRAME_STALE_NS = 5_000_000_000  # frame lebih tua dari ini berarti pipeline kamera sudah mati
 SAFE_CAPTURE_NAME = re.compile(r"[A-Za-z0-9._-]+\.(jpg|jpeg|png)")
 
 class IMX477CameraCore:
@@ -286,6 +287,16 @@ class IMX477CameraCore:
             print(f"[CORE CAMERA] Decode error: {e}")
             return None
 
+    def is_alive(self) -> bool:
+        """True kalau kamera benar-benar masih menghasilkan frame baru."""
+        if not self.started or self.last_frame_time_ns is None:
+            return False
+        return time.time_ns() - self.last_frame_time_ns < FRAME_STALE_NS
+
+    def reopen(self) -> bool:
+        self.close()
+        return bool(self.open())
+
     def capture_jpeg_bytes(self):
         """Mengambil JPEG bytes langsung (tanpa perlu decode ke numpy).
         Lebih efisien untuk streaming via WebSocket.
@@ -335,6 +346,10 @@ class IMX477CameraCore:
         """Menyimpan gambar fisik resolusi tinggi untuk kebutuhan pengumpulan dataset."""
         jpeg_bytes = self.capture_jpeg_bytes()
         if jpeg_bytes is None:
+            return None
+        # Frame basi dari pipeline yang sudah mati tidak boleh tersimpan sebagai citra baru.
+        if self.last_frame_time_ns is not None and time.time_ns() - self.last_frame_time_ns >= FRAME_STALE_NS:
+            print("[CORE CAMERA ERROR] Frame terakhir sudah basi, citra tidak diambil.")
             return None
 
         if not os.path.exists(output_dir):

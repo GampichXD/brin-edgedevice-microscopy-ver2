@@ -144,7 +144,7 @@ async def command_worker(websocket, commands: asyncio.Queue):
 
             if action in ["MOVE_MOTOR", "HOMING", "UNLOCK", "SET_POSITION", "APPLY_CNC_SETTINGS", "APPLY_SOFT_LIMITS"]:
                 await handle_motor_action(action, data, websocket, ws_lock)
-            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "CALIBRATE_FLATFIELD", "PURGE_CACHE", "PURGE_ALL_DATASETS", "PURGE_DATASET_FOLDER", "PURGE_DATASET_FILES"]:
+            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "CALIBRATE_FLATFIELD", "PURGE_SESSION", "PURGE_CACHE", "PURGE_ALL_DATASETS", "PURGE_DATASET_FOLDER", "PURGE_DATASET_FILES"]:
                 await handle_camera_action(action, data, websocket, ws_lock, state)
             elif action in ["START_STITCHING", "START_DL_COUNT", "APPLY_IMAGE_EDIT", "CV_COLONY_COUNT", "CV_THRESHOLD", "CV_CONTOUR", "CV_MORPHOLOGY", "CV_SOBEL", "CV_ROI", "CV_CALIBRATE", "CV_COLOR_SPLIT"]:
                 await handle_ai_action(action, data, websocket, ws_lock, state)
@@ -203,21 +203,14 @@ async def send_stream_task(websocket, state):
                             h, w = frame.shape[:2]
                             fps_w = max(1.0, float(state["target_fps"]))
                             path = state["recording_filepath"]
-                            # Coba beberapa codec — 'vp09' sering TIDAK tersedia di
-                            # OpenCV Jetson. mp4v (.mp4) & MJPG (.avi) hampir selalu ada.
-                            attempts = [
-                                (path.rsplit(".", 1)[0] + ".mp4", "mp4v"),
-                                (path.rsplit(".", 1)[0] + ".avi", "MJPG"),
-                                (path, "vp09"),
-                            ]
+                            # MJPG selalu tersedia. Dikonversi ke H.264 saat rekaman berhenti.
+                            attempts = [(path, "MJPG")]
                             vw = None
                             for cand_path, cc in attempts:
                                 try:
                                     test = cv2.VideoWriter(cand_path, cv2.VideoWriter_fourcc(*cc), fps_w, (w, h))
                                     if test.isOpened():
                                         vw = test
-                                        state["recording_filepath"] = cand_path
-                                        state["recording_final_filepath"] = state["recording_final_filepath"].rsplit(".", 1)[0] + "." + cand_path.rsplit(".", 1)[1]
                                         print(f"[BRIDGE] VideoWriter OK ({cc}): {cand_path} ({w}x{h} @ {fps_w}fps)")
                                         break
                                     test.release()
@@ -291,6 +284,7 @@ async def telemetry_sender(websocket):
                     "soft_limits": motor_core.soft_limits,
                     "at_limit": motor_core.limit_flags(),
                     "z_units_per_step": motor_core.z_units_per_step,
+                    "camera_status": "BUSY" if edge_state.stitching else ("OK" if camera_core.is_alive() else "OFFLINE"),
                 }))
         except Exception:
             break

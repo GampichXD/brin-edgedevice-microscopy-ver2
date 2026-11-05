@@ -46,7 +46,8 @@ def sync_datasets():
     # =========================================================================
     for folder_name in os.listdir(DATASET_DIR):
         folder_path = os.path.join(DATASET_DIR, folder_name)
-        if not os.path.isdir(folder_path):
+        # Nama berawalan '_' adalah folder kerja (mis. _stage_scaled_*), bukan dataset.
+        if not os.path.isdir(folder_path) or folder_name.startswith("_"):
             continue
             
         # Temukan semua file media (gambar dan video) di dalam folder ini
@@ -84,6 +85,10 @@ def sync_datasets():
                         with open(synced_marker, 'w') as marker:
                             marker.write("SYNCED_OK")
                         print(f"[SYNCER UPSTREAM] SUKSES! File {file_name} telah di-backup ke VPS.")
+                    elif response.status_code == 404:
+                        # Folder tidak dikenal VPS: file lain di folder ini pasti ditolak juga.
+                        print(f"[SYNCER UPSTREAM] Folder {folder_name} tidak ada di VPS, dilewati pada siklus ini.")
+                        break
                     else:
                         print(f"[SYNCER UPSTREAM] GAGAL mengunggah {file_name}. Server VPS merespon: {response.status_code}")
                 except requests.exceptions.RequestException as e:
