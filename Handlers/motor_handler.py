@@ -4,6 +4,10 @@ import time
 from Hardware.Devices.motor import motor_core
 from Hardware.Utils import test_logger
 
+def _result_status(grbl_resp) -> str:
+    return "ERROR" if str(grbl_resp).startswith("ERROR") else "SUCCESS"
+
+
 async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
     """Router untuk instruksi mekanika CNC/Motor.
     PENTING: Semua operasi serial motor dijalankan di thread pool agar
@@ -21,7 +25,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
-                "status": "SUCCESS",
+                "status": _result_status(grbl_resp),
                 "grbl_response": grbl_resp
             }))
 
@@ -31,7 +35,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
-                "status": "SUCCESS",
+                "status": _result_status(grbl_resp),
                 "grbl_response": grbl_resp
             }))
 
@@ -41,7 +45,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
-                "status": "SUCCESS",
+                "status": _result_status(grbl_resp),
                 "grbl_response": grbl_resp
             }))
 
@@ -52,7 +56,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         )
         async with ws_lock:
             await websocket.send(json.dumps({
-                "event": "MOTOR_MOVED", "status": "SUCCESS", "grbl_response": grbl_resp
+                "event": "MOTOR_MOVED", "status": _result_status(grbl_resp), "grbl_response": grbl_resp
             }))
 
     elif action == "APPLY_CNC_SETTINGS":

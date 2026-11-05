@@ -6,6 +6,10 @@ import re
 import json
 import os
 
+def _mock_allowed():
+    return os.getenv("ALLOW_MOCK_HARDWARE", "0") == "1"
+
+
 def _env_limit(name):
     raw = os.getenv(name, "").strip()
     try:
@@ -140,9 +144,8 @@ class GRBLMotorCore:
         
         if target_port is None and platform.system() == "Windows":
             print("[CORE MOTOR WARNING] Perangkat keras tidak ditemukan di port Windows COM.")
-            print("[CORE MOTOR] Mengaktifkan MODE SIMULASI LURING untuk core hardware script...")
-            self.is_mock_mode = True
-            return True
+            self.is_mock_mode = _mock_allowed()
+            return self.is_mock_mode
 
         try:
             print(f"[CORE MOTOR] Membuka sirkuit komunikasi serial ke {target_port}...")
@@ -169,8 +172,12 @@ class GRBLMotorCore:
             return True
         except Exception as e:
             print(f"[CORE MOTOR ERROR] Gagal mengunci port fisik serial: {e}")
-            print("[CORE MOTOR] Mengalihkan sistem ke MODE SIMULASI LURING...")
-            self.is_mock_mode = True
+            # Motor tidak tersambung dilaporkan apa adanya (status Offline, perintah ERROR).
+            # Simulasi hanya kalau diminta eksplisit, supaya data uji tidak pernah tercampur.
+            self.ser = None
+            self.is_mock_mode = _mock_allowed()
+            if self.is_mock_mode:
+                print("[CORE MOTOR] ALLOW_MOCK_HARDWARE=1: MODE SIMULASI LURING aktif.")
             return False
 
     def _check_z_resolution(self):
@@ -557,6 +564,8 @@ class GRBLMotorCore:
     def set_position(self, x=0.0, y=0.0, z=0.0):
         """ADMIN: tulis ulang koordinat kerja TANPA menggerakkan motor.
         Kirim G92 ke GRBL (set work offset) lalu persist ke motor_position.json."""
+        if not self._motor_available():
+            return "ERROR: Jalur komunikasi serial tidak aktif."
         self.last_known_pos = {"X": round(float(x), 3), "Y": round(float(y), 3), "Z": round(float(z), 3)}
         self.is_relative_mode = False
         if not self.is_mock_mode and self.ser is not None and self.ser.is_open:
@@ -568,7 +577,12 @@ class GRBLMotorCore:
         print(f"[CORE MOTOR] Koordinat kerja di-set manual ke {self.last_known_pos}")
         return "ok"
 
+    def _motor_available(self) -> bool:
+        return self.is_mock_mode or (self.ser is not None and self.ser.is_open)
+
     def homing(self):
+        if not self._motor_available():
+            return "ERROR: Jalur komunikasi serial tidak aktif."
         self.clear_hold()
         self.last_known_pos = {"X": 0.0, "Y": 0.0, "Z": 0.0}
         self.is_relative_mode = False

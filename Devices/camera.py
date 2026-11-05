@@ -65,6 +65,7 @@ class IMX477CameraCore:
                     if first_frame is not None:
                         with self.read_lock:
                             self.jpeg_frame = first_frame
+                            self.last_frame_time_ns = time.time_ns()
                         self.started = True
                         self.thread = threading.Thread(target=self._update_loop_gst, daemon=True)
                         self.thread.start()

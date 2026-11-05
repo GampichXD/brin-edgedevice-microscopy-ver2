@@ -108,3 +108,27 @@ def test_B4_cmd_csv_mencatat_waktu(tmp_path, monkeypatch):
         row = next(csv.DictReader(f))
     assert list(row) == ["cmd_id", "gcode", "t_rx_ns", "t_ok_ns"]
     assert row["cmd_id"] == "7" and row["t_rx_ns"] == "123" and int(row["t_ok_ns"]) > 123
+
+
+def test_tanpa_grbl_tidak_ada_simulasi_diam_diam(tmp_path, monkeypatch):
+    monkeypatch.delenv("ALLOW_MOCK_HARDWARE", raising=False)
+    monkeypatch.setattr(GRBLMotorCore, "_find_hardware_port", lambda self: "/dev/port-tidak-ada")
+    m = GRBLMotorCore()
+    m.position_file = str(tmp_path / "pos.json")
+    m.last_known_pos = {"X": 5.0, "Y": 6.0, "Z": 7.0}
+    assert m.open() is False and m.is_mock_mode is False
+    assert m.get_status()["status"] == "Offline"
+    assert m.jog_from_gcode("G1 X1.000 F250").startswith("ERROR")
+    assert m.homing().startswith("ERROR")
+    assert m.set_position(0, 0, 0).startswith("ERROR")
+    assert m.last_known_pos == {"X": 5.0, "Y": 6.0, "Z": 7.0}
+
+
+def test_simulasi_hanya_kalau_diminta(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALLOW_MOCK_HARDWARE", "1")
+    monkeypatch.setattr(GRBLMotorCore, "_find_hardware_port", lambda self: "/dev/port-tidak-ada")
+    m = GRBLMotorCore()
+    m.position_file = str(tmp_path / "pos.json")
+    m.open()
+    assert m.is_mock_mode is True
+    assert m.jog_from_gcode("G1 X1.000 F250") == "ok"

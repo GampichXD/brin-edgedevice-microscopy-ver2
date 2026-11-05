@@ -161,7 +161,6 @@ async def watchdog_task(link: LinkState):
 
 async def send_stream_task(websocket, state):
     """TASK 2: Membaca frame JPEG dari hardware Edge Camera secara asinkron lalu disiarkan ke VPS."""
-    import numpy as np
     print("[BRIDGE] Task pemancar video stream aktif di background loop.")
     while True:
         start_t = time.time()
@@ -174,15 +173,16 @@ async def send_stream_task(websocket, state):
 
             if state["is_streaming"]:
                 # Ambil JPEG bytes langsung dari buffer kamera (lebih efisien, skip re-encode)
-                t_read_ns = time.time_ns()
                 jpeg_bytes = camera_core.capture_jpeg_bytes()
 
-                # --- MOCK FALLBACK: Jika kamera offline, buat frame hitam ---
-                if jpeg_bytes is None:
-                    fallback_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(fallback_frame, "CAMERA OFFLINE", (120, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (80, 80, 80), 3)
-                    ret, buf = cv2.imencode('.jpg', fallback_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                    jpeg_bytes = buf.tobytes() if ret else None
+                # Kamera offline, atau kamera belum menghasilkan frame baru: tidak ada
+                # yang dikirim. Frame duplikat membuat FPS dan latensi terukur lebih baik
+                # dari kenyataan, dan membuang bandwidth.
+                frame_time = camera_core.last_frame_time_ns
+                if jpeg_bytes is None or frame_time == state.get("last_frame_time_ns"):
+                    await asyncio.sleep(0.005)
+                    continue
+                state["last_frame_time_ns"] = frame_time
 
                 # Tulis ke video file jika sedang recording (perlu decode ke numpy)
                 if state["is_recording"] and jpeg_bytes is not None:
@@ -227,7 +227,7 @@ async def send_stream_task(websocket, state):
                         await websocket.send(json.dumps({
                             "event": "STREAM_DATA",
                             "image": f"data:image/jpeg;base64,{base64_str}",
-                            "t_cap": camera_core.last_frame_time_ns or t_read_ns,
+                            "t_cap": frame_time,
                             "frame_id": state["frame_id"],
                         }))
             else:
