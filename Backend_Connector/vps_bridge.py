@@ -14,7 +14,7 @@ from Hardware.Devices.motor import motor_core
 from Hardware.Devices.camera import camera_core
 
 from Hardware.Utils.telemetry import get_jetson_temperatures, get_jetson_memory_stats
-from Hardware.Utils import edge_state
+from Hardware.Utils import edge_state, test_logger
 from Hardware.Handlers.motor_handler import handle_motor_action
 from Hardware.Handlers.camera_handler import handle_camera_action
 from Hardware.Handlers.ai_handler import handle_ai_action
@@ -22,6 +22,17 @@ from Hardware.Handlers.ai_handler import handle_ai_action
 # Konfigurasi Koneksi VPS & Direktori Edge
 VPS_WS_URL = os.getenv("VPS_WS_URL", "ws://127.0.0.1:8000/api/hardware/ws")
 EDGE_TOKEN_REJECTED_BACKOFF_S = 30
+
+# Watchdog koneksi. VPS mengirim PING tiap 1 detik (lihat hardware.py /ws).
+WATCHDOG_TIMEOUT = float(os.getenv("WATCHDOG_TIMEOUT", "3"))
+WATCHDOG_TICK_S = 0.25
+WATCHDOG_MAX_LOOP_LAG_S = 0.5
+PING_MESSAGE = '{"action": "PING"}'
+# Keepalive transport hanya untuk mendeteksi socket mati supaya bisa reconnect; motor
+# dihentikan oleh watchdog di atas. Timeout dibuat longgar: pong tertahan selama VPS
+# mengirim payload besar (mis. panorama base64 untuk CV) dan koneksi tidak boleh ikut putus.
+WS_PING_INTERVAL = float(os.getenv("WS_PING_INTERVAL", "5"))
+WS_PING_TIMEOUT = float(os.getenv("WS_PING_TIMEOUT", "20"))
 
 
 def _edge_ws_url() -> str:
@@ -45,9 +56,54 @@ state = {
     "recording_final_filepath": ""
 }
 
-async def receive_handler(websocket):
-    """TASK 1: Fokus mendengarkan instruksi masuk dari VPS secara asinkron."""
+class LinkState:
+    """Status link VPS untuk watchdog. Watchdog baru aktif (armed) setelah PING pertama
+    dari server, sehingga Jetson baru yang tersambung ke VPS lama tidak salah memicu hold."""
+    def __init__(self):
+        self.last_rx = time.monotonic()
+        self.armed = False
+        self.hold_sent = False
+
+    def age_ms(self) -> float:
+        return (time.monotonic() - self.last_rx) * 1000.0
+
+
+def _log_watchdog(event: str, age_ms: float) -> None:
+    test_logger.log("watchdog_log", always=True, t_ns=time.time_ns(), event=event,
+                    last_rx_age_ms=round(age_ms, 1), motor_state=motor_core.last_status)
+
+
+def _hold_motor(link: LinkState, event: str) -> None:
+    """Motor berhenti saat link hilang. Tidak pernah resume otomatis: gerak berikutnya
+    hanya lewat perintah baru, yang akan melepas Hold (lihat GRBLMotorCore.clear_hold)."""
+    if link.hold_sent:
+        return
+    link.hold_sent = True
+    age = link.age_ms()
+    _log_watchdog(event, age)
+    if motor_core.feed_hold():
+        _log_watchdog("FEED_HOLD_SENT", age)
+
+
+async def receive_handler(websocket, link: LinkState, commands: asyncio.Queue):
+    """TASK 1: Fokus membaca pesan masuk dari VPS. Tidak mengeksekusi apa pun di sini,
+    supaya perintah lambat (capture, ganti setting kamera) tidak terbaca sebagai link putus."""
     async for message in websocket:
+        link.last_rx = time.monotonic()
+        t_rx_ns = time.time_ns()
+        if link.hold_sent:
+            link.hold_sent = False
+            _log_watchdog("LINK_RESTORED", 0.0)
+        if message == PING_MESSAGE:
+            link.armed = True
+            continue
+        commands.put_nowait((message, t_rx_ns))
+
+
+async def command_worker(websocket, commands: asyncio.Queue):
+    """Mengeksekusi perintah dari VPS satu per satu, sesuai urutan datangnya."""
+    while True:
+        message, t_rx_ns = await commands.get()
         try:
             data = json.loads(message)
             action = data.get("action", "").upper()
@@ -87,6 +143,20 @@ async def receive_handler(websocket):
 
         except Exception as e:
             print(f"[BRIDGE ERROR] Gagal memproses data handler: {e}")
+
+
+async def watchdog_task(link: LinkState):
+    """Tahan motor kalau tidak ada pesan dari VPS selama WATCHDOG_TIMEOUT detik."""
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(WATCHDOG_TICK_S)
+        # Event loop sempat macet: PING mungkin sudah menunggu di socket, jadi beri
+        # kesempatan reader membacanya dulu sebelum menyimpulkan link putus.
+        if time.monotonic() - t0 - WATCHDOG_TICK_S > WATCHDOG_MAX_LOOP_LAG_S:
+            continue
+        if link.armed and link.age_ms() > WATCHDOG_TIMEOUT * 1000.0:
+            _hold_motor(link, "WATCHDOG_TRIGGERED")
+
 
 async def send_stream_task(websocket, state):
     """TASK 2: Membaca frame JPEG dari hardware Edge Camera secara asinkron lalu disiarkan ke VPS."""
@@ -213,16 +283,32 @@ async def hardware_control_loop():
     
     while True:
         try:
-            async with websockets.connect(_edge_ws_url(), max_size=None, ping_interval=None) as websocket:
+            link = LinkState()
+            async with websockets.connect(_edge_ws_url(), max_size=None,
+                                          ping_interval=WS_PING_INTERVAL,
+                                          ping_timeout=WS_PING_TIMEOUT) as websocket:
                 print("[EDGE SUCCESS] Pipa jaringan asinkron ganda terhubung penuh!")
                 async with ws_lock:
                     await websocket.send(json.dumps({"status": "READY", "device": "JETSON_ORIN_NANO"}))
-                
-                await asyncio.gather(
-                    receive_handler(websocket),
-                    send_stream_task(websocket, state),
-                    telemetry_sender(websocket)
-                )
+
+                commands = asyncio.Queue()
+                helpers = [
+                    asyncio.create_task(command_worker(websocket, commands)),
+                    asyncio.create_task(send_stream_task(websocket, state)),
+                    asyncio.create_task(telemetry_sender(websocket)),
+                    asyncio.create_task(watchdog_task(link)),
+                ]
+                try:
+                    await receive_handler(websocket, link, commands)
+                finally:
+                    # Link habis: hentikan motor dulu, lalu buang perintah yang belum jalan.
+                    _hold_motor(link, "WATCHDOG_TRIGGERED")
+                    for task in helpers:
+                        task.cancel()
+                    await asyncio.gather(*helpers, return_exceptions=True)
+            # Penutupan normal dari server (1000/1001) tidak melempar exception.
+            print("[EDGE ERROR] VPS menutup sambungan. Menghubungkan ulang dalam 5 detik...")
+            await asyncio.sleep(5)
         except websockets.exceptions.ConnectionClosed as e:
             if e.rcvd is not None and e.rcvd.code == 4003:
                 print(f"[EDGE ERROR] Device token ditolak VPS. Mencoba lagi dalam {EDGE_TOKEN_REJECTED_BACKOFF_S} detik.")

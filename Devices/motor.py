@@ -27,6 +27,9 @@ class GRBLMotorCore:
         self.last_axis_direction = {"X": None, "Y": None, "Z": None}
         self.position_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_position.json")
         self.last_status = "Idle"
+        # True setelah feed_hold(): GRBL diam di state Hold dan tidak menjalankan gerak
+        # apa pun sampai clear_hold() dipanggil oleh perintah berikutnya dari operator.
+        self.hold_latched = False
         self._last_saved_pos = None  # snapshot terakhir yang sudah ditulis ke JSON (throttle)
         self._load_position()
 
@@ -342,7 +345,78 @@ class GRBLMotorCore:
 
         return jog_response
 
+    def feed_hold(self) -> bool:
+        """Hentikan motor sekarang juga (byte realtime GRBL '!', tanpa newline).
+        Sengaja tidak menunggu serial_lock, yang bisa tertahan sampai 1 detik."""
+        self.hold_latched = True
+        if self.is_mock_mode:
+            print("[MOCK MOTOR] Feed hold.")
+            return True
+        if self.ser is None or not self.ser.is_open:
+            return False
+        try:
+            self.ser.write(b"!")
+            print("[CORE MOTOR] Feed hold '!' dikirim.")
+            return True
+        except Exception as e:
+            print(f"[CORE MOTOR ERROR] Gagal mengirim feed hold: {e}")
+            return False
+
+    def jog_cancel(self) -> bool:
+        """Batalkan jog $J= yang sedang berjalan (byte realtime GRBL 0x85)."""
+        if self.is_mock_mode:
+            return True
+        if self.ser is None or not self.ser.is_open:
+            return False
+        try:
+            self.ser.write(b"\x85")
+            return True
+        except Exception as e:
+            print(f"[CORE MOTOR ERROR] Gagal mengirim jog cancel: {e}")
+            return False
+
+    def clear_hold(self) -> None:
+        """Keluar dari Hold TANPA melanjutkan gerak lama. '~' (resume) tidak dipakai:
+        sisa gerak yang tersela akan ikut jalan. Soft reset membuang sisa gerak, posisi
+        mesin tetap terjaga selama motor sudah diam (Hold:0). Reset juga menghapus offset
+        G92 dan mode G91, sehingga keduanya dipulihkan seperti saat open()."""
+        if not self.hold_latched:
+            return
+        self.hold_latched = False
+        self.is_relative_mode = False
+        if self.is_mock_mode:
+            return
+        if self.ser is None or not self.ser.is_open:
+            return
+
+        # Soft reset saat motor masih melambat memicu ALARM dan posisi hilang.
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            status = self.get_status()["status"]
+            if status in ("Hold:0", "Idle"):
+                break
+            time.sleep(0.1)
+        else:
+            print(f"[CORE MOTOR WARNING] Motor belum diam sebelum soft reset (status={status}).")
+
+        pos = dict(self.last_known_pos)
+        try:
+            with self.serial_lock:
+                self.ser.write(b"\x18")
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    if self.ser.readline().decode("utf-8", "ignore").startswith("Grbl"):
+                        break
+        except Exception as e:
+            print(f"[CORE MOTOR ERROR] Soft reset gagal: {e}")
+            return
+
+        self.send_command("$X")
+        self.send_command(f"G92 X{pos['X']} Y{pos['Y']} Z{pos['Z']}")
+        print(f"[CORE MOTOR] Hold dilepas lewat soft reset. Posisi kerja dipulihkan: {pos}")
+
     def jog_from_gcode(self, command: str):
+        self.clear_hold()
         # Gunakan strict regex ^...$ agar hanya mencegat single-axis G1 (joystick)
         # Jika multi-axis (contoh: G1 X10 Y20), match akan gagal dan diteruskan utuh ke send_command (sebagai absolute move)
         match = re.search(r"^G1\s+([XYZ])\s*([+-]?[\d.]+)(?:\s+F([\d.]+))?$", command.strip(), re.IGNORECASE)
@@ -451,6 +525,7 @@ class GRBLMotorCore:
         return "ok"
 
     def homing(self):
+        self.clear_hold()
         self.last_known_pos = {"X": 0.0, "Y": 0.0, "Z": 0.0}
         self.is_relative_mode = False
         self._persist_if_changed()
@@ -461,6 +536,7 @@ class GRBLMotorCore:
         return self.send_command("G0 X0 Y0 Z0")
 
     def unlock(self):
+        self.clear_hold()
         return self.send_command("$X")
 
     def close(self):

@@ -16,6 +16,23 @@ if not os.path.exists(LOCAL_TMP_DIR):
 def _safe_session(s):
     return re.sub(r"[^A-Za-z0-9_-]", "", str(s))[:40] or "adhoc"
 
+
+def _encode_preview(src_path):
+    """JPEG preview lebar maks 900 px; kalau gagal, kirim berkas aslinya."""
+    try:
+        img = cv2.imread(src_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            if w > 900:
+                img = cv2.resize(img, (900, max(1, int(h * 900 / w))))
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                return buf.tobytes()
+    except Exception:
+        pass
+    with open(src_path, "rb") as f:
+        return f.read()
+
 async def handle_camera_action(action: str, data: dict, websocket, ws_lock, state: dict):
     """Router untuk instruksi dan konfigurasi Kamera"""
     if action == "APPLY_CAMERA_SETTINGS":
@@ -102,8 +119,11 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
             save_dir = LOCAL_TMP_DIR
             local_name = requested_filename  # boleh None -> camera_core buat nama sendiri
 
-        saved = camera_core.save_snapshot(save_dir, prefix=prefix, coord_x=cx, coord_y=cy,
-                                          requested_filename=local_name)
+        # Disk I/O dan encode di thread pool: event loop harus tetap bebas supaya
+        # watchdog koneksi tidak salah membaca loop yang macet sebagai link putus.
+        saved = await asyncio.to_thread(
+            camera_core.save_snapshot, save_dir, prefix=prefix, coord_x=cx, coord_y=cy,
+            requested_filename=local_name)
         if saved:
             local_path = os.path.join(save_dir, saved)
             print(f"[BRIDGE CAMERA] Tersimpan: {local_path}")
@@ -135,22 +155,7 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         # WebSocket kecil -> tidak menyumbat stream/telemetri saat grid besar
         # (mis. 5x5+). Full-res tetap ada di folder sesi untuk stitching.
         try:
-            src_path = local_path
-            frame_bytes = None
-            try:
-                img = cv2.imread(src_path)
-                if img is not None:
-                    h, w = img.shape[:2]
-                    if w > 900:
-                        img = cv2.resize(img, (900, max(1, int(h * 900 / w))))
-                    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    if ok:
-                        frame_bytes = buf.tobytes()
-            except Exception:
-                frame_bytes = None
-            if frame_bytes is None:
-                with open(src_path, "rb") as f:
-                    frame_bytes = f.read()
+            frame_bytes = await asyncio.to_thread(_encode_preview, local_path)
             encoded_image = base64.b64encode(frame_bytes).decode('utf-8')
             async with ws_lock:
                 await websocket.send(json.dumps({
