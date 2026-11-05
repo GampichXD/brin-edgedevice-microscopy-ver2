@@ -1,0 +1,7 @@
+matplotlib
+pandas
+numpy
+requests
+websockets
+psutil
+pytest
