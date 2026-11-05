@@ -4,11 +4,12 @@ import json
 import base64
 import shutil
 import asyncio
+import subprocess
 import time
 import cv2
 from datetime import datetime
 from Hardware.Devices.camera import camera_core
-from Hardware.Utils import flatfield, test_logger
+from Hardware.Utils import edge_state, flatfield, test_logger
 
 LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp_images"))
 if not os.path.exists(LOCAL_TMP_DIR):
@@ -17,6 +18,51 @@ if not os.path.exists(LOCAL_TMP_DIR):
 
 def _safe_session(s):
     return re.sub(r"[^A-Za-z0-9_-]", "", str(s))[:40] or "adhoc"
+
+
+_finalize_tasks = set()  # pegang referensi agar task tidak di-GC
+TRANSCODE_TIMEOUT_S = 3600
+
+
+def _transcode_to_h264(src, dst):
+    """MJPG AVI -> H.264 MP4 dengan moov di depan, supaya bisa diputar dan di-seek di browser.
+    Orin Nano tidak punya encoder H.264 hardware, jadi memakai x264 dengan preset tercepat.
+    Output selalu I420 baseline, karena selain itu Chrome menolak memutarnya."""
+    pipeline = [
+        "nice", "-n", "10", "gst-launch-1.0", "-q",
+        "filesrc", f"location={src}", "!", "avidemux", "!", "jpegdec", "!", "videoconvert", "!",
+        "video/x-raw,format=I420", "!",
+        "x264enc", "speed-preset=ultrafast", "bframes=0", "threads=2", "!",
+        "video/x-h264,profile=baseline", "!", "h264parse", "!",
+        "mp4mux", "faststart=true", "!", "filesink", f"location={dst}",
+    ]
+    done = subprocess.run(pipeline, capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_S)
+    if done.returncode != 0:
+        raise RuntimeError((done.stderr or done.stdout).strip()[-300:])
+
+
+def _finalize_recording(temp_path, final_path):
+    """Hasil konversi baru muncul dengan nama final setelah utuh, supaya syncer tidak
+    mengunggah file setengah jadi. Kalau konversi gagal, rekaman mentah tetap disimpan."""
+    if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+        print(f"[BRIDGE ERROR] Rekaman kosong atau tidak ada: {temp_path}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return False
+    partial = os.path.join(os.path.dirname(final_path), "_temp_" + os.path.basename(final_path))
+    try:
+        _transcode_to_h264(temp_path, partial)
+        if os.path.getsize(partial) == 0:
+            raise RuntimeError("hasil konversi kosong")
+        os.replace(partial, final_path)
+        os.remove(temp_path)
+        print(f"[BRIDGE] SUKSES! Video H.264 disimpan: {final_path}")
+        return True
+    except Exception as e:
+        print(f"[BRIDGE ERROR] Konversi video gagal, rekaman mentah tetap di {temp_path}: {e}")
+        if os.path.exists(partial):
+            os.remove(partial)
+        return False
 
 
 def _apply_flatfield(path):
@@ -61,6 +107,11 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
     elif action == "START_STREAM":
         print("[BRIDGE] Perintah VPS: Aktifkan Live Stream.")
         state["is_streaming"] = True
+        # Kamera gagal dibuka atau pipeline mati: coba lagi tanpa perlu restart main.py.
+        # Saat stitching kamera sengaja ditutup untuk menghemat memori.
+        if not camera_core.is_alive() and not edge_state.stitching:
+            print("[BRIDGE] Kamera tidak aktif, mencoba membuka ulang...")
+            await asyncio.to_thread(camera_core.reopen)
 
     elif action == "STOP_STREAM":
         print("[BRIDGE] Perintah VPS: Matikan Live Stream.")
@@ -83,7 +134,8 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
             # .mp4 (mp4v) — codec paling kompatibel di OpenCV Jetson & browser.
             filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
             state["recording_final_filepath"] = os.path.join(rec_dir, filename)
-            state["recording_filepath"] = os.path.join(rec_dir, f"_temp_{filename}")
+            # Direkam dulu sebagai MJPG, lalu dikonversi ke H.264 saat berhenti (lihat _finalize_recording).
+            state["recording_filepath"] = os.path.join(rec_dir, f"_temp_{os.path.splitext(filename)[0]}.avi")
             state["recording_pending_init"] = True
             print(f"[BRIDGE] Mulai merekam video ke {state['recording_filepath']}")
 
@@ -95,17 +147,11 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
                 state["video_writer"].release()
                 print(f"[BRIDGE] VideoWriter dirilis. File sementara: {state['recording_filepath']}")
                 state["video_writer"] = None
-                if os.path.exists(state["recording_filepath"]):
-                    file_size = os.path.getsize(state["recording_filepath"])
-                    print(f"[BRIDGE] Ukuran file sementara: {file_size} bytes")
-                    if file_size > 0:
-                        os.rename(state["recording_filepath"], state["recording_final_filepath"])
-                        print(f"[BRIDGE] SUKSES! File final disimpan: {state['recording_final_filepath']}")
-                    else:
-                        os.remove(state["recording_filepath"])
-                        print(f"[BRIDGE ERROR] File sementara 0-byte, dihapus. Recording gagal!")
-                else:
-                    print(f"[BRIDGE ERROR] File sementara tidak ditemukan: {state['recording_filepath']}")
+                # Di latar belakang: video panjang butuh waktu, dan perintah motor tidak boleh tertahan.
+                task = asyncio.create_task(asyncio.to_thread(
+                    _finalize_recording, state["recording_filepath"], state["recording_final_filepath"]))
+                _finalize_tasks.add(task)
+                task.add_done_callback(_finalize_tasks.discard)
             else:
                 print(f"[BRIDGE ERROR] STOP_RECORDING dipanggil tapi video_writer=None. Tidak ada frame yang direkam!")
             print("[BRIDGE] Perekaman video dihentikan.")
@@ -201,6 +247,16 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
                     pass
             print(f"[BRIDGE] ✅ Purge selesai. {cleared} item dihapus dari {LOCAL_TMP_DIR}.")
             
+    elif action == "PURGE_SESSION":
+        # Hanya berkas kerja satu sesi scan. Dataset yang sudah disimpan tidak tersentuh.
+        session = _safe_session(data.get("session") or "")
+        if data.get("session"):
+            for name in (session, f"_stage_{session}", f"_stage_scaled_{session}"):
+                target = os.path.join(LOCAL_TMP_DIR, name)
+                if os.path.isdir(target):
+                    shutil.rmtree(target, ignore_errors=True)
+                    print(f"[BRIDGE] 🧹 PURGE_SESSION: {target} dihapus.")
+
     elif action == "PURGE_DATASET_FOLDER":
         # VPS menghapus 1 folder dataset -> hapus salinan lokal di local_datasets/<id>
         folder_id = _safe_session(data.get("folder_id", ""))
@@ -245,7 +301,6 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
 
     elif action == "PURGE_ALL_DATASETS":
         print("[BRIDGE] 🚨 Menerima perintah PURGE_ALL_DATASETS dari VPS!")
-        import shutil
         # Hapus LOCAL_TMP_DIR isinya
         if os.path.exists(LOCAL_TMP_DIR):
             shutil.rmtree(LOCAL_TMP_DIR, ignore_errors=True)
