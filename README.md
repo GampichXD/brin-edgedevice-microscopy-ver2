@@ -22,6 +22,12 @@ python3 main.py
 - **Grid scan yang sedang berjalan dibatalkan** oleh VPS saat koneksi Jetson putus.
 - **Soft limit** aktif secara default, tetapi batasnya harus diisi di `.env` dari hasil ukur rentang mekanis mesin. Sumbu tanpa nilai tidak dibatasi.
 
+## Tanpa data simulasi
+
+Kalau GRBL tidak tersambung, status motor `Offline` dan perintah gerak ditolak. Kalau kamera mati, tidak ada frame atau citra yang dikirim. Simulasi motor hanya aktif dengan `ALLOW_MOCK_HARDWARE=1`, dan skrip uji menolak jalan dalam mode itu.
+
+Kalau menyambungkan Jetson ke backend uji lokal, set `SYNC_DISABLED=1`.
+
 ## Satuan sumbu Z
 
 Sumbu Z dikonfigurasi GRBL `$102 = 1`, sehingga 1 unit G-code = 1 step. Nilainya dibaca saat start dan dicek terhadap `EXPECTED_Z_STEPS_PER_UNIT`; kalau berbeda, muncul peringatan di log. Label `stp` di web hanya benar selama setelan firmware ini tidak berubah.
