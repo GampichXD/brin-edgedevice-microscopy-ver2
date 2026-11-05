@@ -131,20 +131,10 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
             local_path = os.path.join(save_dir, saved)
             print(f"[BRIDGE CAMERA] Tersimpan: {local_path}")
         else:
-            print("[BRIDGE CAMERA WARNING] Kamera fisik offline. Membangkitkan gambar mockup...")
-            import numpy as np
-            import random
-            saved = local_name or (
-                f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                f"_X{str(cx).replace('.','_')}_Y{str(cy).replace('.','_')}.jpg"
-            )
-            os.makedirs(save_dir, exist_ok=True)
-            local_path = os.path.join(save_dir, saved)
-            mock_img = np.zeros((480, 640, 3), dtype=np.uint8)
-            mock_img[:] = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
-            cv2.putText(mock_img, f"MOCK {saved}", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-            cv2.imwrite(local_path, mock_img)
-            print(f"[BRIDGE CAMERA] MOCK Tersimpan: {local_path}")
+            # Tidak ada gambar pengganti: VPS membalas 504 untuk retake, dan tile grid
+            # dibiarkan kosong supaya bisa di-Retake.
+            print("[BRIDGE CAMERA WARNING] Kamera fisik offline. Citra tidak diambil.")
+            return
 
         # Nama yang DILAPORKAN ke VPS (kontrak static/uploads + capturedImages di
         # frontend). Grid -> nama dari backend 'IMG_<session>_r_c.jpg' (unik lintas
