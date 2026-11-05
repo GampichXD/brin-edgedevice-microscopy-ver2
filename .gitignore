@@ -32,6 +32,7 @@ Thumbs.db
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # Motor position state
 motor_position.json

@@ -6,6 +6,15 @@ import re
 import json
 import os
 
+def _env_limit(name):
+    raw = os.getenv(name, "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        print(f"[CORE MOTOR WARNING] Nilai {name}='{raw}' bukan angka, diabaikan.")
+        return None
+
+
 class GRBLMotorCore:
     def __init__(self, baudrate=115200, timeout=1):
         self.baudrate = baudrate
@@ -22,8 +31,11 @@ class GRBLMotorCore:
             "settle_time": 0,
         }
         # Soft limit switch: batas gerak per sumbu (mm). None = tak dibatasi.
-        self.soft_limits_enabled = False
-        self.soft_limits = {"X": [None, None], "Y": [None, None], "Z": [None, None]}
+        # Aktif secara default, tetapi nilainya harus diisi dari hasil ukur mesin lewat
+        # .env (SOFT_LIMIT_X_MIN dst.). Batas tebakan bisa mengunci motor dari area sah.
+        self.soft_limits_enabled = os.getenv("SOFT_LIMITS_ENABLED", "1") == "1"
+        self.soft_limits = {ax: [_env_limit(f"SOFT_LIMIT_{ax}_MIN"), _env_limit(f"SOFT_LIMIT_{ax}_MAX")]
+                            for ax in ("X", "Y", "Z")}
         self.last_axis_direction = {"X": None, "Y": None, "Z": None}
         self.position_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_position.json")
         self.last_status = "Idle"
