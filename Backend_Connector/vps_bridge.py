@@ -279,6 +279,7 @@ async def telemetry_sender(websocket):
                     "soft_limits_enabled": motor_core.soft_limits_enabled,
                     "soft_limits": motor_core.soft_limits,
                     "at_limit": motor_core.limit_flags(),
+                    "z_units_per_step": motor_core.z_units_per_step,
                 }))
         except Exception:
             break

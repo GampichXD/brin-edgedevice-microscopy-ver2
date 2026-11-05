@@ -57,3 +57,19 @@ def test_jog_tetap_dipotong_satu_kali(tmp_path):
     m.soft_limits = {"X": [0.0, 12.0], "Y": [None, None], "Z": [None, None]}
     m.jog_from_gcode("G1 X5.000 F250")
     assert m.last_known_pos["X"] == 12.0
+
+
+
+
+@pytest.mark.parametrize("reply,value,warn", [
+    ("$100=250.000 | $102=1.000 | ok", 1.0, False),
+    ("$102=250.000 | ok", 0.004, True),
+    ("ok", None, True),
+])
+def test_C6_cek_nilai_102(tmp_path, monkeypatch, capsys, reply, value, warn):
+    m = _motor(tmp_path)
+    monkeypatch.delenv("EXPECTED_Z_STEPS_PER_UNIT", raising=False)
+    monkeypatch.setattr(m, "send_command", lambda cmd: reply)
+    m._check_z_resolution()
+    assert m.z_units_per_step == value
+    assert ("WARNING" in capsys.readouterr().out) is warn

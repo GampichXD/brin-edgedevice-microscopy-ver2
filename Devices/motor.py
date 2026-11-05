@@ -42,6 +42,7 @@ class GRBLMotorCore:
         # True setelah feed_hold(): GRBL diam di state Hold dan tidak menjalankan gerak
         # apa pun sampai clear_hold() dipanggil oleh perintah berikutnya dari operator.
         self.hold_latched = False
+        self.z_units_per_step = None  # dari $102 saat open()
         self._last_saved_pos = None  # snapshot terakhir yang sudah ditulis ke JSON (throttle)
         self._load_position()
 
@@ -161,6 +162,8 @@ class GRBLMotorCore:
             # Sinkronisasi koordinat yang sudah dimuat ke GRBL
             self.send_command(f"G92 X{self.last_known_pos['X']} Y{self.last_known_pos['Y']} Z{self.last_known_pos['Z']}")
                 
+            self._check_z_resolution()
+
             print("[CORE MOTOR SUCCESS] Mesin CNC berhasil terhubung penuh secara fisik.")
             self.is_mock_mode = False
             return True
@@ -169,6 +172,21 @@ class GRBLMotorCore:
             print("[CORE MOTOR] Mengalihkan sistem ke MODE SIMULASI LURING...")
             self.is_mock_mode = True
             return False
+
+    def _check_z_resolution(self):
+        """Di mesin ini 1 unit Z G-code = 1 step, disetel di firmware ($102), bukan di kode.
+        Label 'stp' di web hanya benar selama setelan itu tidak berubah, jadi dicek saat start."""
+        match = re.search(r"\$102=([\d.]+)", self.send_command("$$"))
+        if not match or float(match.group(1)) <= 0:
+            print("[CORE MOTOR WARNING] Nilai $102 tidak terbaca dari GRBL.")
+            return
+        steps_per_unit = float(match.group(1))
+        self.z_units_per_step = 1.0 / steps_per_unit
+        expected = float(os.getenv("EXPECTED_Z_STEPS_PER_UNIT", "1"))
+        print(f"[CORE MOTOR] GRBL $102 = {steps_per_unit} step/unit")
+        if abs(steps_per_unit - expected) > 1e-6:
+            print(f"[CORE MOTOR WARNING] $102={steps_per_unit}, seharusnya {expected}. "
+                  f"Satuan Z 'stp' di web tidak lagi berarti 1 step.")
 
     def send_command(self, command: str) -> str:
         """Mengirimkan G-Code dan membaca semua baris respon dari GRBL hingga tuntas."""
