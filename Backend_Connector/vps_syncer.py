@@ -99,10 +99,17 @@ def sync_datasets():
         if res.status_code == 200:
             server_folders = res.json().get("folders", {})
             for folder_id, data in server_folders.items():
+                folder_id = os.path.basename(str(folder_id))
+                if folder_id in ("", ".", ".."):
+                    continue
                 local_folder_path = os.path.join(DATASET_DIR, folder_id)
                 os.makedirs(local_folder_path, exist_ok=True)
                 
                 for file_name in data.get("files", []):
+                    # Nama dari index server tidak boleh keluar dari folder dataset.
+                    file_name = os.path.basename(str(file_name))
+                    if file_name in ("", ".", ".."):
+                        continue
                     local_file_path = os.path.join(local_folder_path, file_name)
                     # Jika file dari server belum ada di hard disk fisik Jetson
                     if not os.path.exists(local_file_path):
@@ -124,7 +131,9 @@ def sync_datasets():
     # =========================================================================
     # STEP 3: AUTO-CLEANUP (Retensi 7 Hari untuk File Yatim)
     # =========================================================================
-    if server_folders is not None:
+    # Index kosong bisa berarti backend baru atau database lokal saat pengujian, bukan
+    # berarti semua dataset sudah dihapus: jangan pernah dijadikan dasar menghapus.
+    if server_folders:
         current_time = time.time()
         seven_days_sec = 7 * 24 * 3600
         
@@ -157,6 +166,9 @@ def sync_datasets():
                             os.remove(synced_marker)
 
 def run_daemon():
+    if os.getenv("SYNC_DISABLED", "0") == "1":
+        print("[SYNCER] SYNC_DISABLED=1: sinkronisasi dataset dimatikan.")
+        return
     print("="*50)
     print("HYBRID SYNC DAEMON AKTIF")
     print("="*50)
