@@ -7,6 +7,7 @@ import sys
 import cv2
 import time
 import psutil
+from urllib.parse import quote
 
 # Impor driver inti dari folder Hardware
 from Hardware.Devices.motor import motor_core
@@ -20,6 +21,15 @@ from Hardware.Handlers.ai_handler import handle_ai_action
 
 # Konfigurasi Koneksi VPS & Direktori Edge
 VPS_WS_URL = os.getenv("VPS_WS_URL", "ws://127.0.0.1:8000/api/hardware/ws")
+EDGE_TOKEN_REJECTED_BACKOFF_S = 30
+
+
+def _edge_ws_url() -> str:
+    token = os.getenv("EDGE_DEVICE_TOKEN", "")
+    if not token:
+        print("[EDGE WARNING] EDGE_DEVICE_TOKEN belum diisi di .env; VPS bisa menolak koneksi ini.")
+        return VPS_WS_URL
+    return f"{VPS_WS_URL}?device_token={quote(token, safe='')}"
 
 # Global lock to prevent websocket send collisions between video stream and large image payloads
 ws_lock = asyncio.Lock()
@@ -203,7 +213,7 @@ async def hardware_control_loop():
     
     while True:
         try:
-            async with websockets.connect(VPS_WS_URL, max_size=None, ping_interval=None) as websocket:
+            async with websockets.connect(_edge_ws_url(), max_size=None, ping_interval=None) as websocket:
                 print("[EDGE SUCCESS] Pipa jaringan asinkron ganda terhubung penuh!")
                 async with ws_lock:
                     await websocket.send(json.dumps({"status": "READY", "device": "JETSON_ORIN_NANO"}))
@@ -213,7 +223,14 @@ async def hardware_control_loop():
                     send_stream_task(websocket, state),
                     telemetry_sender(websocket)
                 )
-        except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError):
+        except websockets.exceptions.ConnectionClosed as e:
+            if e.rcvd is not None and e.rcvd.code == 4003:
+                print(f"[EDGE ERROR] Device token ditolak VPS. Mencoba lagi dalam {EDGE_TOKEN_REJECTED_BACKOFF_S} detik.")
+                await asyncio.sleep(EDGE_TOKEN_REJECTED_BACKOFF_S)
+            else:
+                print("[EDGE ERROR] Sambungan terputus. Menghubungkan ulang dalam 5 detik...")
+                await asyncio.sleep(5)
+        except ConnectionRefusedError:
             print("[EDGE ERROR] Sambungan terputus. Menghubungkan ulang dalam 5 detik...")
             await asyncio.sleep(5)
         except Exception as e:
