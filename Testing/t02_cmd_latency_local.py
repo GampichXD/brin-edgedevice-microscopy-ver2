@@ -6,7 +6,7 @@ Keluaran: cmd_local.csv (cmd_id,t_sent_ns,t_ok_ns).
 import argparse
 import time
 
-from common import DEFAULT_LOG_DIR, append_row, ensure_exclusive_hardware, open_motor, percentile
+from common import DEFAULT_LOG_DIR, append_row, ensure_exclusive_hardware, open_motor, percentile, wait_idle
 
 
 def main():
@@ -30,7 +30,7 @@ def main():
             t_ok = time.time_ns()
             append_row(args.log_dir, "cmd_local", cmd_id=i, t_sent_ns=t_sent, t_ok_ns=t_ok)
             latencies.append((t_ok - t_sent) / 1e6)
-            time.sleep(0.05)
+            wait_idle(motor, timeout=5)  # jeda sampai gerak selesai, agar antrean GRBL tidak ikut terukur
     finally:
         motor.send_command("G90")
         motor.close()

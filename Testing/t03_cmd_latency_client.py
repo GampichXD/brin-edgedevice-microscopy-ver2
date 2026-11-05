@@ -10,20 +10,15 @@ karena membuat GRBL diam-diam tetap di mode relatif.
 import argparse
 import asyncio
 import json
-import sys
 import time
 
-import websockets
-
-from common import DEFAULT_LOG_DIR, append_row, client_ws_url, login, wait_for_role
+from common import DEFAULT_LOG_DIR, append_row, client_ws_url, connect_as_pilot, login
 
 
 async def run(args):
     base, token = login()
-    async with websockets.connect(client_ws_url(base, token), max_size=None) as ws:
-        role = await wait_for_role(ws)
-        if role != "PILOT":
-            sys.exit(f"Peran koneksi ini {role}, bukan PILOT. Tutup sesi lain lalu ulangi.")
+    ws = await connect_as_pilot(client_ws_url(base, token))
+    async with ws:
         start_id = int(time.time()) * 1000  # unik antar-sesi supaya penggabungan cmd_id tidak bentrok
         for i in range(args.count):
             value = args.step if i % 2 == 0 else -args.step

@@ -10,7 +10,7 @@ import time
 
 import cv2
 
-from common import DEFAULT_LOG_DIR, append_row, ensure_exclusive_hardware, open_camera, open_motor, wait_idle
+from common import DEFAULT_LOG_DIR, append_row, ensure_exclusive_hardware, fresh_frame, open_camera, open_motor, wait_idle
 
 
 def sharpness(frame):
@@ -48,7 +48,7 @@ def main():
                     motor.send_command(target)
                     wait_idle(motor)
                     time.sleep(delay)
-                    value = sharpness(camera.capture_frame())
+                    value = sharpness(fresh_frame(camera))
                     append_row(args.log_dir, "settle", move_type=move_type, delay_s=delay, rep=rep,
                                sharpness=round(value, 3))
                     values.append(value)

@@ -10,9 +10,8 @@ import json
 import time
 
 import requests
-import websockets
 
-from common import DEFAULT_LOG_DIR, append_row, auth_headers, client_ws_url, login, wait_for_role
+from common import DEFAULT_LOG_DIR, append_row, auth_headers, client_ws_url, connect_as_pilot, login
 
 
 def burst_rest(base, headers, args):
@@ -33,10 +32,8 @@ def burst_rest(base, headers, args):
 
 async def burst_ws(base, token, args):
     sent, rejected_ids = [], set()
-    async with websockets.connect(client_ws_url(base, token), max_size=None) as ws:
-        role = await wait_for_role(ws)
-        print(f"Peran WS: {role}")
-
+    ws = await connect_as_pilot(client_ws_url(base, token))
+    async with ws:
         async def reader():
             while True:
                 message = json.loads(await ws.recv())

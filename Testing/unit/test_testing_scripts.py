@@ -12,7 +12,6 @@ TESTING = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, TESTING)
 
 import common  # noqa: E402
-import positioning_math as pm  # noqa: E402
 
 SCRIPTS = ["t00_check_clock.py", "t01_positioning.py", "t02_cmd_latency_local.py", "t03_cmd_latency_client.py",
            "t04_video_client.py", "t05_eta_scan.py", "t05b_settle_sharpness.py", "t06_ratelimit_burst.py"]
@@ -23,7 +22,7 @@ def test_help_jalan_tanpa_perangkat_keras(script):
     out = subprocess.run([sys.executable, os.path.join(TESTING, script), "--help"],
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert "--log-dir" in out.stdout
+    assert "usage" in out.stdout
 
 
 def test_append_row_menambah_tanpa_menimpa(tmp_path):
@@ -36,7 +35,8 @@ def test_append_row_menambah_tanpa_menimpa(tmp_path):
 
 def test_salinan_rumus_t05_sama_dengan_backend():
     import t05_eta_scan as t05
-    backend = os.path.abspath(os.path.join(TESTING, "..", "..", "Software", "backend", "app", "services", "scan_planner.py"))
+    root = os.environ.get("SOFTWARE_REPO") or os.path.join(TESTING, "..", "..", "Software")
+    backend = os.path.abspath(os.path.join(root, "backend", "app", "services", "scan_planner.py"))
     if not os.path.exists(backend):
         pytest.skip("Repo Software tidak ada di sebelah repo ini.")
     namespace = {}
@@ -46,68 +46,61 @@ def test_salinan_rumus_t05_sama_dengan_backend():
     assert t05.predict_seconds(3, 4, 0.5, 250.0, 500) == pytest.approx(expected)
 
 
-UM_PER_PX = 1.7
-MINOR_UM = 10.0
-MINOR_PX = MINOR_UM / UM_PER_PX
+def _slide(path):
+    """Citra sintetis micrometer: pita garis periodik, angka unik, dan vignetting."""
+    h, w = 480, 800
+    img = np.full((h, w, 3), 190, np.uint8)
+    for i, x in enumerate(np.arange(0, w, 17.0)):
+        y1 = 300 if i % 10 == 0 else 330
+        cv2.line(img, (int(x), y1), (int(x), 380), (60, 60, 60), 2)
+    for i, x in enumerate(range(0, w, 170)):
+        cv2.putText(img, str(i), (x + 4, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (30, 30, 30), 2)
+    cv2.imwrite(str(path), img)
 
 
-def _slide(shift_px, width=800, height=400, seed=1):
-    """Citra sintetis micrometer: garis periodik + penanda unik, bergeser shift_px (sub-piksel)."""
-    xx = np.arange(width, dtype=np.float64)
-    profile = 200 - 90 * np.exp(-((((xx - shift_px) % MINOR_PX) - 1.5) ** 2) / 0.8)
-    img = np.tile(profile, (height, 1)).astype(np.float32)
-    # penanda unik di luar pita garis
-    marker = np.zeros((40, 60), np.float32)
-    rng = np.random.default_rng(seed)
-    marker[rng.random(marker.shape) > 0.7] = 1.0
-    marker = cv2.GaussianBlur(marker, (0, 0), 1.0)
-    M = np.float32([[1, 0, 200 + shift_px], [0, 1, 40]])
-    layer = cv2.warpAffine(marker, M, (width, height), flags=cv2.INTER_CUBIC)
-    img[:120] = 180
-    img = img - layer * 150
-    noise = np.random.default_rng(2).normal(0, 1.0, img.shape)
-    return np.clip(np.dstack([img, img, img]) + noise[..., None], 0, 255).astype(np.uint8)
+def test_t01_selftest_memulihkan_pergeseran_sintetis(tmp_path):
+    photo = tmp_path / "slide.png"
+    _slide(photo)
+    out = subprocess.run([sys.executable, os.path.join(TESTING, "t01_positioning.py"), "selftest",
+                          "--image", str(photo), "--roi", "344,260,40,30"],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stdout + out.stderr
 
 
-BAND = (20, 180, 760, 200)
+def _csv(folder, name, header, rows):
+    with open(folder / name, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
 
 
-def test_periode_garis_terdeteksi():
-    gray = pm.preprocess(_slide(0.0))
-    period = pm.estimate_period_px(pm.line_profile(gray, BAND, "X"))
-    assert period == pytest.approx(MINOR_PX, rel=0.01)
-
-
-@pytest.mark.parametrize("shift", [0.37, 1.5, 7.3, 30.0, 88.25, 150.6])
-def test_gabungan_kasar_halus_memulihkan_pergeseran(shift):
-    gray0 = pm.preprocess(_slide(0.0))
-    template = gray0[40:80, 200:260].copy()
-    x0, _, _ = pm.locate_marker(gray0, template)
-    fine0 = pm.fine_phase_px(pm.line_profile(gray0, BAND, "X"), MINOR_PX)
-    pos0, _ = pm.combine(x0, fine0, MINOR_PX)
-
-    gray = pm.preprocess(_slide(shift))
-    x, _, score = pm.locate_marker(gray, template)
-    fine = pm.fine_phase_px(pm.line_profile(gray, BAND, "X"), MINOR_PX)
-    pos, valid = pm.combine(x, fine, MINOR_PX)
-    assert valid and score > 0.8
-    assert pos - pos0 == pytest.approx(shift, abs=0.15)
-
-
-def test_combine_menandai_kasar_yang_berselisih():
-    position, valid = pm.combine(10.0, 2.0, 8.0)
-    assert position == 10.0 and valid
-    _, valid = pm.combine(13.5, 2.0, 8.0)
-    assert not valid
-
-
-def test_arah_tercermin_terukur_dari_gerak():
-    assert pm.motion_direction(-30.0, 0.0) == (-1.0, 0.0)
-    with pytest.raises(ValueError):
-        pm.motion_direction(0.2, 0.1)
-
-
-def test_target_keluar_bidang_pandang_ditolak():
-    bad = pm.target_stays_in_frame((400, 100), (60, 40), (800, 400), (1.0, 0.0), 1.7, [0, 0.3, 0.8])
-    assert bad == [0.8]
-    assert pm.target_stays_in_frame((400, 100), (60, 40), (800, 400), (1.0, 0.0), 1.7, [0, 0.3]) == []
+def test_analyze_hw_cocok_dengan_csv_skrip_ini(tmp_path):
+    data = tmp_path / "logs"
+    data.mkdir()
+    _csv(data, "positioning.csv", ["axis", "target_mm", "run", "direction", "measured_mm", "valid", "score"],
+         [["X", t, r, d, t + 0.002 * r, 1, 0.9] for t in (0, 0.13) for r in (1, 2) for d in ("fwd", "bwd")])
+    _csv(data, "cmd_local.csv", ["cmd_id", "t_sent_ns", "t_ok_ns"], [[i, 100 * i, 100 * i + 5_000_000] for i in range(5)])
+    _csv(data, "cmd_client.csv", ["cmd_id", "path", "t_sent_ns"], [[i, "lan", 100 * i] for i in range(5)])
+    _csv(data, "cmd.csv", ["cmd_id", "gcode", "t_rx_ns", "t_ok_ns"],
+         [[i, "G1 X0.05 F250", 100 * i + 10**7, 100 * i + 2 * 10**7] for i in range(4)] + [["", "G90", 1, 2]])
+    _csv(data, "video.csv", ["frame_id", "t_cap_ns", "t_recv_ns", "bytes"],
+         [[i, i * 33 * 10**6, i * 33 * 10**6 + 80 * 10**6, 50000] for i in range(100)])
+    _csv(data, "eta.csv", ["grid", "run", "n_tiles", "predicted_s", "actual_s"], [["3x3", 1, 9, 9.0, 12.0], ["3x3", 2, 9, 9.0, 12.5]])
+    _csv(data, "ratelimit.csv", ["t_send_ns", "channel", "result"],
+         [[i * 50 * 10**6, ch, "ACCEPTED" if i % 5 == 0 else "REJECTED"] for ch in ("rest", "ws") for i in range(40)])
+    _csv(data, "telemetry.csv", ["t_ns", "status", "x", "y", "z", "cpu", "cpu_temp", "gpu_temp", "ram_used_gb", "ram_total_gb"],
+         [[i * 10**9, "Hold:0" if i > 5 else "Run", 1, 2, 3, 20, 50, 45, 3.0, 8.0] for i in range(10)])
+    _csv(data, "watchdog_log.csv", ["t_ns", "event", "last_rx_age_ms", "motor_state"],
+         [[3 * 10**9, "WATCHDOG_TRIGGERED", 3100, "Run"], [3 * 10**9, "FEED_HOLD_SENT", 3100, "Run"]])
+    _csv(data, "settle.csv", ["move_type", "delay_s", "rep", "sharpness"],
+         [[m, d, r, 100 + d * 10] for m in ("in_row", "row_change") for d in (0, 0.5) for r in (0, 1)])
+    out_dir = tmp_path / "out"
+    out = subprocess.run([sys.executable, os.path.join(TESTING, "analyze_hw.py"), "--data", str(data), "--out", str(out_dir)],
+                         capture_output=True, text=True, timeout=180)
+    assert out.returncode == 0, out.stdout + out.stderr
+    summary = (out_dir / "summary.md").read_text()
+    for section in ("D1.", "D2.", "D3.", "D4.", "D5.", "D6.", "D7.", "D8."):
+        assert section in summary
+    assert "| X |" in summary
+    figures = os.listdir(out_dir / "figures")
+    assert "D1_positioning_X.png" in figures and "D7_watchdog.png" in figures

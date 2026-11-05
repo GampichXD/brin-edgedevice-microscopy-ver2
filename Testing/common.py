@@ -64,16 +64,6 @@ async def heartbeat_loop(ws):
         await ws.send(json.dumps({"action": "HEARTBEAT"}))
 
 
-async def wait_for_role(ws, timeout=10.0):
-    """Peran pertama yang diberikan server untuk koneksi ini."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        message = json.loads(await asyncio.wait_for(ws.recv(), deadline - time.monotonic()))
-        if message.get("event") == "ROLE_ASSIGNED":
-            return message.get("role")
-    return None
-
-
 def ensure_exclusive_hardware():
     """t01, t02, dan t05b memakai serial dan kamera langsung: main.py harus mati."""
     import psutil
@@ -92,7 +82,7 @@ def open_motor():
     """Buka GRBL fisik. Mode simulasi ditolak: datanya tidak bermakna untuk Bab IV."""
     from Hardware.Devices.motor import motor_core
 
-    if not motor_core.open() or motor_core.is_mock_mode:
+    if not motor_core.open() or motor_core.is_mock_mode:  # mock hanya kalau ALLOW_MOCK_HARDWARE=1
         sys.exit("GRBL tidak bisa dibuka. Periksa kabel, dan pastikan port tidak dipakai proses lain.")
     motor_core.unlock()
     return motor_core
@@ -107,6 +97,39 @@ def wait_idle(motor, timeout=60.0):
             return True
         time.sleep(0.05)
     return False
+
+
+def fresh_frame(camera, settle_s=0.0, discard=3, gap=0.05):
+    """Frame baru setelah jeda settle. Beberapa frame dibuang karena buffer kamera bisa
+    masih berisi citra dari sebelum motor berhenti."""
+    if settle_s > 0:
+        time.sleep(settle_s)
+    frame = None
+    for _ in range(discard + 1):
+        time.sleep(gap)
+        frame = camera.capture_frame()
+    return frame
+
+
+async def connect_as_pilot(url, timeout=10.0):
+    """Buka WebSocket klien dengan peran PILOT. Akun ADMIN otomatis mengambil alih kursi."""
+    import websockets
+
+    ws = await websockets.connect(url, max_size=None)
+    deadline = time.monotonic() + timeout
+    role = None
+    while time.monotonic() < deadline:
+        try:
+            message = json.loads(await asyncio.wait_for(ws.recv(), 1.0))
+        except asyncio.TimeoutError:
+            continue
+        if message.get("event") == "ROLE_ASSIGNED":
+            role = message.get("role")
+            if role == "PILOT":
+                return ws
+            await ws.send(json.dumps({"action": "TAKEOVER"}))
+    await ws.close()
+    sys.exit(f"Tidak mendapat peran PILOT (terakhir: {role}). Tutup sesi lain atau pakai akun ADMIN.")
 
 
 def open_camera():

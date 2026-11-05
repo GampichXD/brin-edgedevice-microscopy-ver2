@@ -2,7 +2,7 @@
 
 Semua skrip menambah baris ke `test_logs/*.csv` (tidak menimpa) dan punya `--help`. `analyze_hw.py` mengubah CSV menjadi grafik dan tabel untuk Bab IV. **Jangan ubah nama kolom CSV tanpa mengubah skrip analisis.**
 
-`analyze_hw.py` belum ada di repo ini. Salin ke folder ini dari paket yang menyertai `PERBAIKAN_KODE.md`.
+Skrip di Jetson menolak jalan tanpa GRBL sungguhan, supaya angka dari motor simulasi tidak pernah masuk laporan. `t01 selftest` tetap bisa jalan tanpa motor.
 
 ## Alat
 
@@ -25,6 +25,19 @@ Semua skrip menambah baris ke `test_logs/*.csv` (tidak menimpa) dan punya `--hel
 | 9 | `t07_watchdog_protocol.md` (manual) | Jetson | hidup, `TEST_LOGGING=1` |
 
 Skrip di laptop memakai env `BASE_URL`, `TEST_USER`, dan `TEST_PASS`. Setelah tiap sesi, salin `test_logs/` dari Jetson ke laptop (`scp`), supaya semua CSV ada di satu folder.
+
+## Uji posisi (t01)
+
+1. Letakkan stage micrometer di bawah lensa, fokuskan, pastikan garis skala dan satu angka terlihat. `--minor-um` adalah jarak garis kecil pada label slide.
+2. `python3 Testing/t01_positioning.py calibrate --axis X --minor-um 10`. Buka `test_logs/calib_X_preview.png`, yang diberi grid koordinat tiap 50 piksel.
+3. Pilih kotak yang hanya berisi satu angka skala, lalu ulangi dengan `--roi x,y,w,h`.
+4. `python3 Testing/t01_positioning.py run --axis X --runs 5`, lalu ulangi untuk Y.
+
+Uji algoritma tanpa motor: `python3 Testing/t01_positioning.py selftest --image foto.jpg --roi x,y,w,h`.
+
+## Mencoba Jetson dengan backend lokal
+
+Set `SYNC_DISABLED=1`. `vps_syncer` menghapus dataset lokal berumur lebih dari 7 hari yang tidak ada di server.
 
 ## Analisis
 

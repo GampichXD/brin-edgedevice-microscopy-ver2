@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Akurasi dan repeatability XY dengan stage micrometer (adaptasi ISO 230-2).
-Jalankan di Jetson saat main.py mati. Metode ada di positioning_math.py.
+"""
+t01_positioning.py — Uji akurasi & repeatability posisi X/Y memakai stage micrometer
+(adaptasi ISO 230-2). Dijalankan di JETSON saat main.py MATI.
 
-1. Simpan citra acuan untuk memilih ROI:
-     python3 Testing/t01_positioning.py --axis X --snapshot
-2. Kalibrasi (sekali per sumbu). --marker = kotak penanda unik, misalnya satu angka skala.
-   --band = pita garis skala, tanpa goresan yang tidak ikut bergerak saat meja bergerak:
-     python3 Testing/t01_positioning.py --axis X --calibrate --marker x,y,w,h --band x,y,w,h \
-         --period-um 100 --minor-um 10
-3. Uji:
-     python3 Testing/t01_positioning.py --axis X --targets 0,0.13,0.27,0.38,0.51 --runs 5
-     python3 Testing/t01_positioning.py --axis Y --targets 0,0.07,0.15,0.22,0.29 --runs 5
+Metode "kasar + halus":
+  - KASAR : posisi satu penanda unik (angka skala) dilacak dengan template matching.
+            Unik -> tidak ambigu, tapi kurang presisi.
+  - HALUS : fase garis-garis kecil micrometer (periodik) dari profil intensitas.
+            Presisi sub-piksel, tapi ambigu kelipatan periode P.
+  - GABUNG: d = P*round((d_kasar - d_halus)/P) + d_halus   (syarat: |error kasar| < P/2)
 
-Pastikan nilai --period-um dan --minor-um dari tulisan di label slide. Target sengaja tidak
-kelipatan periode. Keluaran: positioning.csv (axis,target_mm,run,direction,measured_mm,valid,score)
-dan citra di test_logs/positioning_imgs/<axis>/<run>/.
+Subperintah:
+  calibrate  : hitung um/px, sudut garis, arah gerak sumbu di citra, simpan calib_<axis>.json
+  run        : jalankan uji dua arah, tulis positioning.csv
+  selftest   : uji algoritma pada satu foto dengan pergeseran sintetis (tanpa motor)
+
+Contoh:
+  python3 t01_positioning.py calibrate --axis X --minor-um 10 --roi 560,120,90,70
+  python3 t01_positioning.py run --axis X --targets 0,0.13,0.27,0.38,0.51 --runs 5
+  python3 t01_positioning.py selftest --image foto_slide.jpg --roi 560,120,90,70
 """
 import argparse
 import json
@@ -24,178 +28,321 @@ import sys
 import time
 
 import cv2
+import numpy as np
 
-import positioning_math as pm
-from common import DEFAULT_LOG_DIR, append_row, ensure_exclusive_hardware, open_camera, open_motor, wait_idle
-
-CALIB_MOVE_MM = 0.1
-FEED = 250.0
-START_MARGIN_MM = 0.1
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import DEFAULT_LOG_DIR as LOG_DIR, append_row, fresh_frame, open_camera, open_motor, ensure_exclusive_hardware, wait_idle  # noqa: E402
 
 
-def parse_box(text):
-    values = [int(v) for v in text.split(",")]
-    if len(values) != 4:
-        sys.exit("Format kotak: x,y,w,h")
-    return values
+# ======================================================================= algoritma (murni)
+def preprocess(img_bgr):
+    """Kanal hijau (SNR tertinggi pada kamera ini) + flat-field sederhana."""
+    g = img_bgr[:, :, 1].astype(np.float32) if img_bgr.ndim == 3 else img_bgr.astype(np.float32)
+    bg = cv2.GaussianBlur(g, (0, 0), 30) + 1e-3
+    n = g / bg
+    n = (n - n.mean()) / (n.std() + 1e-6)
+    return n
 
 
-def move_abs(motor, axis, value, settle_ms):
-    # Sengaja lewat send_command absolut, bukan jog: kompensasi backlash tidak ikut,
-    # supaya yang terukur adalah perilaku mekanik apa adanya.
-    motor.send_command(f"G1 {axis}{value:.4f} F{FEED}")
-    if not wait_idle(motor):
-        sys.exit("GRBL tidak kembali Idle.")
-    time.sleep(settle_ms / 1000.0)
+def ruler_geometry(pre, min_period_px=6, max_period_px=80, max_angle_deg=20):
+    """Cari frekuensi spasial dominan garis kecil dengan FFT 2D.
+    Kembalikan (period_px, u) dengan u = vektor satuan sepanjang penggaris (tegak lurus garis)."""
+    h, w = pre.shape
+    win = np.outer(np.hanning(h), np.hanning(w)).astype(np.float32)
+    F = np.abs(np.fft.fftshift(np.fft.fft2(pre * win)))
+    cy, cx = h // 2, w // 2
+    yy, xx = np.mgrid[0:h, 0:w]
+    fy, fx = (yy - cy) / h, (xx - cx) / w
+    fr = np.hypot(fx, fy) + 1e-9
+    # Hanya arah dekat horizontal/vertikal (±max_angle_deg). Goresan diagonal di
+    # slide/lensa (±45°) punya frekuensi kuat dan harus diabaikan.
+    ang = np.degrees(np.arctan2(np.abs(fy), np.abs(fx)))          # 0..90
+    near_axis = (ang < max_angle_deg) | (ang > 90 - max_angle_deg)
+    mask = (fr > 1.0 / max_period_px) & (fr < 1.0 / min_period_px) & near_axis
+    F2 = np.where(mask, F, 0)
+    iy, ix = np.unravel_index(np.argmax(F2), F2.shape)
+    vx, vy = fx[iy, ix], fy[iy, ix]
+    f = math.hypot(vx, vy)
+    u = np.array([vx / f, vy / f])
+    # arah kanonik: komponen terbesar bernilai positif
+    if (abs(u[0]) >= abs(u[1]) and u[0] < 0) or (abs(u[1]) > abs(u[0]) and u[1] < 0):
+        u = -u
+    return 1.0 / f, u
 
 
-def capture_gray(camera):
-    frame = camera.capture_frame()
-    if frame is None:
-        sys.exit("Frame kamera kosong.")
-    return frame, pm.preprocess(frame)
+def ruler_geometry_near(pre, roi, half=128, min_period_px=6, max_period_px=80):
+    """Arah & periode GARIS KECIL di sekitar penanda (ROI).
+    1) arah dari FFT 2D potongan di sekitar ROI (hanya dekat horizontal/vertikal);
+    2) periode = puncak autokorelasi pertama (tahan terhadap harmonik garis tipis);
+    3) diperhalus pada pita penuh selebar citra."""
+    x, y, w, h = roi
+    cx, cy = x + w // 2, y + h // 2
+    H, W = pre.shape
+    crop = pre[max(0, cy - half):min(H, cy + half), max(0, cx - half):min(W, cx + half)]
+    _, u = ruler_geometry(crop, min_period_px, max_period_px)
+    rc = _rotate_to_u(crop, u)
+    prof = rc.mean(axis=0)
+    prof = prof - prof.mean()
+    # Autokorelasi: puncak PERTAMA setelah lag 0 = periode dasar garis kecil.
+    # (Spektrum FFT tidak dipakai di sini karena garis tipis menghasilkan
+    #  harmonik kuat di P/2, P/3 yang bisa salah dipilih.)
+    ac = np.correlate(prof, prof, mode="full")[len(prof) - 1:]
+    ac = ac / (ac[0] + 1e-9)
+    lo, hi = int(min_period_px), min(int(max_period_px), len(ac) - 2)
+    peaks = [k for k in range(lo, hi) if ac[k] >= ac[k - 1] and ac[k] >= ac[k + 1] and ac[k] > 0.2]
+    if not peaks:
+        raise RuntimeError("Garis periodik tidak terdeteksi di sekitar ROI. Pilih ROI yang menempel pada penggaris.")
+    k = peaks[0]
+    d = ac[k - 1] - 2 * ac[k] + ac[k + 1]
+    p0 = k + (0.5 * (ac[k - 1] - ac[k + 1]) / d if abs(d) > 1e-9 else 0.0)
+    return refine_period(pre, u, p0), u
 
 
-def measure(gray, template, calib):
-    """Posisi sepanjang sumbu gerak (mm), plus status valid dan skor template."""
-    axis = calib["axis"]
-    mx, my, score = pm.locate_marker(gray, template)
-    profile = pm.line_profile(gray, calib["band"], axis)
-    fine = pm.fine_phase_px(profile, calib["minor_px"])
-    coarse_along = mx if axis == "X" else my
-    position_px, valid = pm.combine(coarse_along, fine, calib["minor_px"])
-    # Koreksi sudut antara garis skala dan arah gerak meja, dan arah tercermin.
-    direction = calib["direction"][0] if axis == "X" else calib["direction"][1]
-    position_mm = position_px * calib["um_per_px"] / 1000.0 / direction
-    return position_mm, valid and score >= 0.5, score
+def refine_period(pre, u, p0, span=0.06, steps=301):
+    """Cari periode presisi di sekitar p0 pada pita garis selebar citra."""
+    rot = _rotate_to_u(pre, u)
+    rows = band_rows(rot, p0)
+    prof = rot[rows[0]:rows[1], :].mean(axis=0)
+    prof = (prof - prof.mean()) * np.hanning(len(prof))
+    n = np.arange(len(prof))
+    best, bp = -1, p0
+    for P in np.linspace(p0 * (1 - span), p0 * (1 + span), steps):
+        m = abs(np.sum(prof * np.exp(-2j * np.pi * n / P)))
+        if m > best:
+            best, bp = m, P
+    return float(bp)
 
 
-def calib_path(log_dir, axis):
-    return os.path.join(log_dir, f"calib_{axis}.json")
+def _rotate_to_u(pre, u):
+    """Putar citra supaya arah u menjadi sumbu +x (garis penggaris jadi vertikal)."""
+    h, w = pre.shape
+    ang = math.degrees(math.atan2(u[1], u[0]))
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0)
+    return cv2.warpAffine(pre, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
 
-def do_calibrate(args, motor, camera):
-    if not args.marker or not args.band:
-        sys.exit("--calibrate butuh --marker dan --band. Pakai --snapshot untuk melihat citra.")
-    frame, gray = capture_gray(camera)
-    x, y, w, h = parse_box(args.marker)
-    template = gray[y:y + h, x:x + w].copy()
-    band = parse_box(args.band)
-
-    profile = pm.line_profile(gray, band, args.axis)
-    minor_px = pm.estimate_period_px(profile)
-    um_per_px = args.minor_um / minor_px
-
-    start = motor.get_status()[args.axis]
-    x0, y0, _ = pm.locate_marker(gray, template)
-    move_abs(motor, args.axis, start + CALIB_MOVE_MM, args.settle_ms)
-    _, moved = capture_gray(camera)
-    x1, y1, score = pm.locate_marker(moved, template)
-    move_abs(motor, args.axis, start, args.settle_ms)
-    if score < 0.5:
-        sys.exit(f"Penanda tidak ketemu setelah bergerak (skor {score:.2f}). Pilih penanda lain.")
-    direction = pm.motion_direction(x1 - x0, y1 - y0)
-
-    calib = {
-        "axis": args.axis, "minor_um": args.minor_um, "period_um": args.period_um,
-        "minor_px": minor_px, "um_per_px": um_per_px, "band": band, "marker": [x, y, w, h],
-        "direction": direction, "camera_angle_deg": math.degrees(math.atan2(direction[1], direction[0])),
-        "frame_size": [gray.shape[1], gray.shape[0]],
-    }
-    os.makedirs(args.log_dir, exist_ok=True)
-    with open(calib_path(args.log_dir, args.axis), "w") as f:
-        json.dump(calib, f, indent=2)
-    cv2.imwrite(os.path.join(args.log_dir, f"marker_{args.axis}.png"), template)
-
-    expected = CALIB_MOVE_MM * 1000.0 / um_per_px
-    actual = math.hypot(x1 - x0, y1 - y0)
-    print(f"um_per_px={um_per_px:.4f}, garis kecil={minor_px:.2f} px, arah={direction}")
-    print(f"Pemeriksaan skala: gerak {CALIB_MOVE_MM} mm mengharapkan {expected:.1f} px, terukur {actual:.1f} px")
-    if abs(actual - expected) > 0.2 * expected:
-        print("PERINGATAN: selisih lebih dari 20%. Periksa --minor-um dan --band.")
+def band_rows(rot, period_px, frac=0.5):
+    """Baris-baris yang berisi garis periodik (energi tinggi pada frekuensi 1/P)."""
+    n = rot.shape[1]
+    k = np.exp(-2j * np.pi * np.arange(n) / period_px) * np.hanning(n)
+    mag = np.abs(rot @ k)
+    sm = np.convolve(mag, np.ones(9) / 9, mode="same")
+    rows = np.where(sm > frac * sm.max())[0]
+    return int(rows.min()), int(rows.max()) + 1
 
 
-def do_test(args, motor, camera):
-    path = calib_path(args.log_dir, args.axis)
-    if not os.path.exists(path):
-        sys.exit(f"Belum ada {path}. Jalankan --calibrate dulu.")
-    with open(path) as f:
-        calib = json.load(f)
-    template = cv2.imread(os.path.join(args.log_dir, f"marker_{args.axis}.png"), cv2.IMREAD_GRAYSCALE)
+def fine_phase(pre, u, period_px, rows):
+    """Fase (radian) pola periodik sepanjang u di pita baris 'rows'."""
+    rot = _rotate_to_u(pre, u)
+    prof = rot[rows[0]:rows[1], :].mean(axis=0)
+    prof = prof - prof.mean()
+    n = len(prof)
+    z = np.sum(prof * np.hanning(n) * np.exp(-2j * np.pi * np.arange(n) / period_px))
+    return float(np.angle(z))
 
-    targets = sorted(float(t) for t in args.targets.split(","))
-    _, gray = capture_gray(camera)
-    mx, my, score = pm.locate_marker(gray, template)
-    bad = pm.target_stays_in_frame((mx, my), template.shape[::-1], calib["frame_size"], calib["direction"],
-                                   calib["um_per_px"], targets, START_MARGIN_MM)
-    if bad:
-        sys.exit(f"Target {bad} membuat penanda keluar bidang pandang. Pakai rentang lebih kecil.")
 
-    base = motor.get_status()[args.axis]
-    img_root = os.path.join(args.log_dir, "positioning_imgs", args.axis)
-    rejected = 0
+def coarse_position(pre, templ):
+    """Posisi (x, y) piksel template di citra, dengan penyempurnaan parabola sub-piksel."""
+    res = cv2.matchTemplate(pre.astype(np.float32), templ.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+    _, score, _, (x, y) = cv2.minMaxLoc(res)
+
+    def sub(a, b, c):
+        d = a - 2 * b + c
+        return 0.0 if abs(d) < 1e-9 else 0.5 * (a - c) / d
+    dx = sub(res[y, x - 1], res[y, x], res[y, x + 1]) if 0 < x < res.shape[1] - 1 else 0.0
+    dy = sub(res[y - 1, x], res[y, x], res[y + 1, x]) if 0 < y < res.shape[0] - 1 else 0.0
+    return np.array([x + dx, y + dy]), float(score)
+
+
+class Tracker:
+    """Mengukur pergeseran (piksel, sepanjang u) relatif terhadap citra referensi."""
+    def __init__(self, ref_bgr, roi, period_px, u):
+        self.period, self.u = period_px, np.asarray(u, float)
+        pre = preprocess(ref_bgr)
+        x, y, w, h = roi
+        self.templ = pre[y:y + h, x:x + w].copy()
+        self.rows = band_rows(_rotate_to_u(pre, self.u), period_px)
+        self.p0, _ = coarse_position(pre, self.templ)
+        self.phi0 = fine_phase(pre, self.u, period_px, self.rows)
+
+    def displacement(self, img_bgr):
+        pre = preprocess(img_bgr)
+        p, score = coarse_position(pre, self.templ)
+        d_coarse = float(np.dot(p - self.p0, self.u))
+        dphi = fine_phase(pre, self.u, self.period, self.rows) - self.phi0
+        d_fine = -dphi / (2 * np.pi) * self.period          # modulo P
+        k = round((d_coarse - d_fine) / self.period)
+        d = k * self.period + d_fine
+        resid = abs(d - d_coarse)
+        valid = int(score > 0.6 and resid < 0.4 * self.period)
+        return d, d_coarse, score, valid
+
+
+# ======================================================================= selftest
+def selftest(a):
+    img = cv2.imread(a.image)
+    if img is None:
+        sys.exit(f"Tidak bisa membaca {a.image}")
+    roi = tuple(int(v) for v in a.roi.split(","))
+    period, u = ruler_geometry_near(preprocess(img), roi)
+    tr = Tracker(img, roi, period, u)
+    print(f"Periode garis kecil = {period:.3f} px | arah penggaris u = ({u[0]:.3f}, {u[1]:.3f}) | "
+          f"pita baris = {tr.rows}")
+    errs = []
+    for s in [-31.7, -12.3, -3.1, 0.0, 2.4, 7.77, 15.2, 26.9, 41.3]:
+        M = np.float32([[1, 0, s * u[0]], [0, 1, s * u[1]]])
+        sh = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC,
+                            borderMode=cv2.BORDER_REFLECT)
+        d, dc, sc, ok = tr.displacement(sh)
+        errs.append(d - s)
+        print(f"  geser {s:7.2f} px -> ukur {d:7.3f} (kasar {dc:7.2f}, skor {sc:.2f}, valid {ok}) "
+              f"error {d - s:+.3f} px")
+    e = np.abs(errs)
+    print(f"Error rata-rata {e.mean():.3f} px, maks {e.max():.3f} px")
+    if a.minor_um:
+        print(f"  ≈ {e.mean() * a.minor_um / period:.2f} µm rata-rata (dengan {a.minor_um} µm/garis)")
+    sys.exit(0 if e.max() < 0.5 else 1)
+
+
+# ======================================================================= calibrate & run
+def calib_path(axis):
+    return os.path.join(LOG_DIR, f"calib_{axis}.json")
+
+
+def calibrate(a):
+    ensure_exclusive_hardware()
+    motor = open_motor()   # menolak mode simulasi: datanya tidak sah untuk laporan
+    cam = open_camera()
     try:
-        for run in range(1, args.runs + 1):
-            os.makedirs(os.path.join(img_root, str(run)), exist_ok=True)
-            origin = None
-            # Dua arah dengan pendekatan konsisten: maju dari bawah target terkecil, lalu mundur.
-            move_abs(motor, args.axis, base + targets[0] - START_MARGIN_MM, args.settle_ms)
-            for direction, sequence in (("up", targets), ("down", list(reversed(targets)))):
-                if direction == "down":
-                    move_abs(motor, args.axis, base + targets[-1] + START_MARGIN_MM, args.settle_ms)
-                for target in sequence:
-                    move_abs(motor, args.axis, base + target, args.settle_ms)
-                    frame, gray = capture_gray(camera)
-                    cv2.imwrite(os.path.join(img_root, str(run), f"{direction}_{target:.3f}.png"), frame)
-                    position, valid, score = measure(gray, template, calib)
-                    if origin is None:
-                        origin = position - target
-                    rejected += not valid
-                    append_row(args.log_dir, "positioning", axis=args.axis, target_mm=target, run=run,
-                               direction=direction, measured_mm=round(position - origin, 5),
-                               valid=int(valid), score=round(score, 3))
-            print(f"Run {run}/{args.runs} selesai")
+        os.makedirs(LOG_DIR, exist_ok=True)
+        img0 = fresh_frame(cam, settle_s=1.0)
+        prev = os.path.join(LOG_DIR, f"calib_{a.axis}_preview.png")
+        _save_preview(img0, prev)
+        print(f"Preview dengan grid koordinat: {prev}  (pakai untuk memilih --roi angka skala)")
+        if not a.roi:
+            print("Buka preview, pilih kotak di sekitar SATU angka skala yang menempel pada penggaris,")
+            print("lalu ulangi perintah ini dengan --roi x,y,w,h.")
+            return
+        roi = tuple(int(v) for v in a.roi.split(","))
+        period, u = ruler_geometry_near(preprocess(img0), roi)
+        um_per_px = a.minor_um / period
+        h, w = img0.shape[:2]
+        print(f"Periode garis kecil {period:.3f} px  ->  {um_per_px:.4f} µm/px | "
+              f"FOV ≈ {w * um_per_px / 1000:.3f} × {h * um_per_px / 1000:.3f} mm | "
+              f"arah penggaris u = ({u[0]:.3f}, {u[1]:.3f})")
+        tr = Tracker(img0, roi, period, u)
+        # arah gerak sumbu meja di citra: gerak +step lalu ukur
+        pos = motor.get_status()
+        start = float(pos.get(a.axis, 0.0))
+        motor.move_xyz(**{a.axis.lower(): round(start + a.step, 4)}, feedrate=a.feed)
+        wait_idle(motor)
+        d, dc, sc, ok = tr.displacement(fresh_frame(cam, settle_s=a.settle_ms / 1000))
+        motor.move_xyz(**{a.axis.lower(): round(start, 4)}, feedrate=a.feed)
+        wait_idle(motor)
+        sign = 1 if d > 0 else -1
+        motion_um_per_px = a.step * 1000 / abs(d) if abs(d) > 1e-6 else float("nan")
+        cal = {"axis": a.axis, "period_px": period, "u": u.tolist(), "um_per_px": um_per_px,
+               "minor_um": a.minor_um, "roi": roi, "sign": sign, "step_mm": a.step,
+               "motion_check_um_per_px": motion_um_per_px, "score": sc, "valid": ok,
+               "image_size": [w, h], "t_ns": time.time_ns()}
+        cv2.imwrite(os.path.join(LOG_DIR, f"calib_{a.axis}_ref.png"), img0)
+        with open(calib_path(a.axis), "w") as f:
+            json.dump(cal, f, indent=2)
+        print(json.dumps(cal, indent=2))
+        print(f"Cek silang: skala dari gerak motor = {motion_um_per_px:.4f} µm/px "
+              f"(dari penggaris {um_per_px:.4f}). Selisih besar = cek langkah/steps-per-mm.")
     finally:
-        move_abs(motor, args.axis, base, args.settle_ms)
-    print(f"Selesai. Baris valid=0: {rejected}. Baris itu sebaiknya diperiksa, bukan langsung dibuang.")
+        cam.close()
+        motor.close()
+
+
+def _save_preview(img, path, step=50):
+    p = img.copy()
+    for x in range(0, p.shape[1], step):
+        cv2.line(p, (x, 0), (x, p.shape[0]), (0, 0, 255) if x % 250 == 0 else (0, 255, 255), 1)
+        if x % 250 == 0:
+            cv2.putText(p, str(x), (x + 2, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+    for y in range(0, p.shape[0], step):
+        cv2.line(p, (0, y), (p.shape[1], y), (0, 0, 255) if y % 250 == 0 else (0, 255, 255), 1)
+        if y % 250 == 0:
+            cv2.putText(p, str(y), (2, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+    cv2.imwrite(path, p)
+
+
+def run(a):
+    if not os.path.exists(calib_path(a.axis)):
+        sys.exit(f"Belum ada {calib_path(a.axis)}. Jalankan 'calibrate' dulu.")
+    cal = json.load(open(calib_path(a.axis)))
+    targets = [float(t) for t in a.targets.split(",")]
+    span_mm = max(targets) - min(targets)
+    w = cal["image_size"][0]
+    fov_mm = w * cal["um_per_px"] / 1000
+    if span_mm > 0.7 * fov_mm:
+        sys.exit(f"Rentang target {span_mm:.3f} mm terlalu besar untuk FOV {fov_mm:.3f} mm "
+                 f"(maks ±{0.7 * fov_mm:.3f} mm). Perkecil --targets.")
+    ensure_exclusive_hardware()
+    motor = open_motor()   # menolak mode simulasi: datanya tidak sah untuk laporan
+    cam = open_camera()
+    ax = a.axis.lower()
+    try:
+        origin = float(motor.get_status().get(a.axis, 0.0))
+        ref = cv2.imread(os.path.join(LOG_DIR, f"calib_{a.axis}_ref.png"))
+        tr = Tracker(ref, tuple(cal["roi"]), cal["period_px"], cal["u"])
+        img_dir = os.path.join(LOG_DIR, "positioning_imgs", a.axis)
+        for run_i in range(1, a.runs + 1):
+            os.makedirs(os.path.join(img_dir, str(run_i)), exist_ok=True)
+            # pendekatan konsisten: mulai dari sebelum target pertama
+            motor.move_xyz(**{ax: round(origin + min(targets) - a.approach, 4)}, feedrate=a.feed)
+            wait_idle(motor)
+            base = None
+            for direction, seq in (("fwd", targets), ("bwd", list(reversed(targets)))):
+                if direction == "bwd":   # lewati target terjauh sedikit lalu kembali
+                    motor.move_xyz(**{ax: round(origin + max(targets) + a.approach, 4)}, feedrate=a.feed)
+                    wait_idle(motor)
+                for t in seq:
+                    motor.move_xyz(**{ax: round(origin + t, 4)}, feedrate=a.feed)
+                    wait_idle(motor)
+                    img = fresh_frame(cam, settle_s=a.settle_ms / 1000)
+                    d_px, d_c, score, valid = tr.displacement(img)
+                    mm = cal["sign"] * d_px * cal["um_per_px"] / 1000
+                    if base is None:
+                        base = mm - t            # posisi terukur relatif target pertama run ini
+                    measured = mm - base
+                    cv2.imwrite(os.path.join(img_dir, str(run_i), f"{direction}_{t:.3f}.png"), img)
+                    append_row(LOG_DIR, "positioning", axis=a.axis, target_mm=t, run=run_i, direction=direction,
+                               measured_mm=round(measured, 5), valid=valid, score=round(score, 3))
+                    print(f"run {run_i} {direction} target {t:.3f} mm -> terukur {measured:.4f} mm "
+                          f"(dev {1000 * (measured - t):+.1f} µm, valid {valid})")
+        motor.move_xyz(**{ax: round(origin, 4)}, feedrate=a.feed)
+        wait_idle(motor)
+    finally:
+        cam.close()
+        motor.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--axis", required=True, choices=["X", "Y"])
-    parser.add_argument("--snapshot", action="store_true", help="simpan citra acuan lalu keluar")
-    parser.add_argument("--calibrate", action="store_true")
-    parser.add_argument("--marker", help="x,y,w,h kotak penanda unik")
-    parser.add_argument("--band", help="x,y,w,h pita garis skala")
-    parser.add_argument("--period-um", type=float, default=100.0, help="jarak antar-angka")
-    parser.add_argument("--minor-um", type=float, default=10.0, help="jarak garis kecil")
-    parser.add_argument("--targets", default="0,0.13,0.27,0.38,0.51")
-    parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--settle-ms", type=int, default=800)
-    parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
-    args = parser.parse_args()
-
-    ensure_exclusive_hardware()
-    camera = open_camera()
-    if args.snapshot:
-        os.makedirs(args.log_dir, exist_ok=True)
-        frame, gray = capture_gray(camera)
-        cv2.imwrite(os.path.join(args.log_dir, f"snapshot_{args.axis}.png"), frame)
-        cv2.imwrite(os.path.join(args.log_dir, f"snapshot_{args.axis}_pre.png"), gray)
-        print(f"Tersimpan di {args.log_dir}. Pilih kotak --marker dan --band dari citra ini.")
-        camera.close()
-        return
-
-    motor = open_motor()
-    motor.send_command("G90")
-    try:
-        if args.calibrate:
-            do_calibrate(args, motor, camera)
-        else:
-            do_test(args, motor, camera)
-    finally:
-        camera.close()
-        motor.close()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("calibrate")
+    c.add_argument("--axis", choices=["X", "Y"], required=True)
+    c.add_argument("--minor-um", type=float, default=10.0, help="jarak garis kecil (µm), cek label slide")
+    c.add_argument("--roi", help="x,y,w,h kotak penanda unik (angka skala) di citra")
+    c.add_argument("--step", type=float, default=0.1, help="gerak uji arah sumbu (mm)")
+    c.add_argument("--feed", type=float, default=100)
+    c.add_argument("--settle-ms", type=int, default=800)
+    r = sub.add_parser("run")
+    r.add_argument("--axis", choices=["X", "Y"], required=True)
+    r.add_argument("--targets", default="0,0.13,0.27,0.38,0.51")
+    r.add_argument("--runs", type=int, default=5)
+    r.add_argument("--approach", type=float, default=0.1, help="jarak pendekatan sebelum target (mm)")
+    r.add_argument("--feed", type=float, default=100)
+    r.add_argument("--settle-ms", type=int, default=800)
+    s = sub.add_parser("selftest")
+    s.add_argument("--image", required=True)
+    s.add_argument("--roi", required=True)
+    s.add_argument("--minor-um", type=float, default=10.0)
+    a = ap.parse_args()
+    {"calibrate": calibrate, "run": run, "selftest": selftest}[a.cmd](a)
 
 
 if __name__ == "__main__":
