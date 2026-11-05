@@ -3,6 +3,13 @@ import time
 import requests
 from glob import glob
 
+try:
+    from Hardware.Utils import edge_state
+except Exception:  # dijalankan mandiri tanpa package root
+    class _ES:  # noqa: N801
+        stitching = False
+    edge_state = _ES()
+
 # Konfigurasi: 
 # Ambil lokasi absolut dari file script ini (Backend_Connector)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,8 +23,14 @@ VPS_BASE_URL = os.getenv("VPS_BASE_URL", "http://localhost:8000/api/dataset")
 SYNC_INTERVAL = 10
 
 def sync_datasets():
+    # Rem total selama tile stitching berat: hindari requests.post file besar +
+    # I/O disk yang berebut RAM/CPU dengan subprocess stitching.
+    if getattr(edge_state, "stitching", False):
+        print("[SYNCER] Ditunda — tile stitching sedang berjalan.")
+        return
+
     print(f"[SYNCER] Memantau direktori lokal Jetson: {DATASET_DIR}")
-    
+
     if not os.path.exists(DATASET_DIR):
         print("[SYNCER] Direktori dataset belum terbentuk. Menunggu...")
         return

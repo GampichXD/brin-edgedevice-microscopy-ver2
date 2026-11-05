@@ -1,11 +1,13 @@
 import os
 import sys
 import json
+import time
 import base64
 import glob
 import re
 import shutil
 import asyncio
+from Hardware.Utils import edge_state
 try:
     import requests
 except ImportError:
@@ -34,6 +36,35 @@ _STITCH_SCRIPTS = {
     "sift_lg":        ("SIFT_LG.py",    "result_sift_lg.jpg"),
     "brute_force":    ("brute_force.py", "result_brute_force.jpg"),
 }
+
+# Grid besar: di atas ambang ini, tile dikecilkan dulu supaya panorama muat RAM
+# Jetson (canvas keluaran ~ jumlah_tile, di 680 tile bisa OOM). Bisa disetel
+# lewat env STITCH_BIG_TILES / STITCH_BIG_SCALE.
+_STITCH_BIG_TILES = int(os.getenv("STITCH_BIG_TILES", "560"))
+_STITCH_BIG_SCALE = float(os.getenv("STITCH_BIG_SCALE", "0.6"))
+
+
+def _downscale_dir(src_dir, dst_dir, scale):
+    """Salin semua tile dari src_dir ke dst_dir dengan ukuran diperkecil `scale`.
+    Nama berkas dipertahankan (pola tile_r_c dikenali pipeline)."""
+    import cv2
+    if os.path.exists(dst_dir):
+        shutil.rmtree(dst_dir)
+    os.makedirs(dst_dir)
+    n = 0
+    for f in sorted(os.listdir(src_dir)):
+        if not f.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
+        img = cv2.imread(os.path.join(src_dir, f))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        small = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+        cv2.imwrite(os.path.join(dst_dir, f), small, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        n += 1
+    return n
+
 
 # Penanda di stdout pipeline -> (persen, label) untuk event STITCH_PROGRESS.
 _STITCH_MILESTONES = [
@@ -281,31 +312,74 @@ _CV_CLASSIC = {
 }
 
 
-async def handle_ai_action(action: str, data: dict, websocket, ws_lock):
-    """Router untuk instruksi Computer Vision dan AI"""
-    if action == "START_STITCHING":
-        model_key = (data.get("model") or "sp_lg_tensorrt").lower()
-        if model_key not in _STITCH_SCRIPTS:
-            model_key = "sp_lg_tensorrt"
-        session = data.get("session")
-        print(f"[BRIDGE AI] Tile Stitching (model={model_key}, sesi={session})...")
+_stitch_task = None  # ref agar task background tidak di-GC
 
-        async def emit_progress(pct, label):
-            try:
-                async with ws_lock:
-                    await websocket.send(json.dumps({
-                        "event": "STITCH_PROGRESS", "pct": int(pct), "phase": label,
-                    }))
-            except Exception:
-                pass
 
+async def _pause_edge_for_stitch(state):
+    """Bebaskan RAM/CPU sebelum subprocess stitching berat: matikan stream,
+    tutup pipeline kamera (nvarguscamerasrc menahan ratusan MB), rem syncer &
+    telemetri lewat edge_state.stitching."""
+    edge_state.stream_was_on = bool(state.get("is_streaming")) if isinstance(state, dict) else False
+    if isinstance(state, dict):
+        state["is_streaming"] = False
+    edge_state.stitching = True
+    try:
+        await asyncio.to_thread(camera_core.close)
+        print("[BRIDGE AI] Kamera ditutup sementara untuk memberi ruang RAM stitching.")
+    except Exception as e:
+        print(f"[BRIDGE AI] (info) gagal menutup kamera: {e}")
+    await asyncio.sleep(0.8)
+
+
+async def _resume_edge_after_stitch(state):
+    edge_state.stitching = False
+    try:
+        await asyncio.to_thread(camera_core.open)
+        print("[BRIDGE AI] Kamera dibuka kembali setelah stitching.")
+    except Exception as e:
+        print(f"[BRIDGE AI] (info) gagal membuka kamera lagi: {e}")
+    if isinstance(state, dict):
+        state["is_streaming"] = edge_state.stream_was_on
+
+
+async def _run_stitch_job(data, websocket, ws_lock, state):
+    """Seluruh proses tile stitching, DIJALANKAN SEBAGAI TASK BACKGROUND supaya
+    receive_handler tetap responsif. Dijamin selalu mengirim STITCHING_COMPLETE
+    atau STITCHING_FAILED — tidak pernah melempar exception ke pemanggil."""
+    model_key = (data.get("model") or "sp_lg_tensorrt").lower()
+    if model_key not in _STITCH_SCRIPTS:
+        model_key = "sp_lg_tensorrt"
+    session = data.get("session")
+    print(f"[BRIDGE AI] Tile Stitching (model={model_key}, sesi={session}) — mulai.")
+
+    async def emit_progress(pct, label):
+        try:
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "STITCH_PROGRESS", "pct": int(pct), "phase": label,
+                }))
+        except Exception:
+            pass
+
+    async def emit_failed(detail):
+        print(f"[BRIDGE AI ERROR] Stitching gagal: {detail}")
+        try:
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "STITCHING_FAILED", "status": "ERROR",
+                    "detail": detail or "Stitching gagal di Edge Device.",
+                }))
+        except Exception:
+            pass
+
+    paused = False
+    try:
         await emit_progress(5, "Menyiapkan tile")
 
         tiles = data.get("tiles")
         stage_dir = None
         staged = 0
 
-        # 1) Folder sesi terisolasi yang sudah berisi 'tile_r<row>_c<col>.jpg'.
         if session:
             sess_dir = os.path.join(LOCAL_TMP_DIR, _safe_session(session))
             grid_files = glob.glob(os.path.join(sess_dir, "tile_r*_c*.jpg"))
@@ -314,7 +388,6 @@ async def handle_ai_action(action: str, data: dict, websocket, ws_lock):
                 staged = len(grid_files)
                 print(f"[BRIDGE AI] Memakai folder sesi ({staged} tile): {sess_dir}")
 
-        # 2) Fallback: stage dari daftar 'tiles' ke folder staging PER-SESI.
         if stage_dir is None:
             stage_dir = os.path.join(LOCAL_TMP_DIR, "_stage_" + _safe_session(session or "adhoc"))
             if tiles:
@@ -323,78 +396,165 @@ async def handle_ai_action(action: str, data: dict, websocket, ws_lock):
                 captured_tiles = [os.path.join(LOCAL_TMP_DIR, img) for img in data["images"]]
                 staged = _stage_tiles_for_sp_lg(captured_tiles, stage_dir)
             else:
-                print("[BRIDGE AI ERROR] Tidak ada tile yang ditentukan (tiles/images kosong).")
                 staged = 0
 
-        output_file = None
-        fail_detail = ""
+        if staged < 2:
+            await emit_failed(f"Tile dengan posisi valid kurang dari 2 (staged={staged}).")
+            return
 
-        if staged >= 2:
-            script, result_name = _STITCH_SCRIPTS[model_key]
-            script_path = os.path.join(_QM_DIR, script)
-            expected = os.path.join(stage_dir, result_name)
-            if os.path.exists(expected):
-                os.remove(expected)
+        await emit_progress(10, f"Menyiapkan {staged} tile")
 
-            await emit_progress(12, f"Menjalankan {model_key}")
+        # Bebaskan RAM sebelum subprocess (fork main.py butuh ruang sebesar RSS-nya).
+        await _pause_edge_for_stitch(state)
+        paused = True
+
+        script, result_name = _STITCH_SCRIPTS[model_key]
+        script_path = os.path.join(_QM_DIR, script)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join([_REPO_ROOT, _QM_DIR, env.get("PYTHONPATH", "")])
+        scaled_dir = os.path.join(LOCAL_TMP_DIR, "_stage_scaled_" + _safe_session(session or "adhoc"))
+        t0 = time.time()
+
+        async def run_pipeline(run_dir):
+            """Jalankan pipeline sekali di run_dir. Return (rc, err_tail, expected_path)."""
+            exp = os.path.join(run_dir, result_name)
+            if os.path.exists(exp):
+                os.remove(exp)
             try:
-                env = dict(os.environ)
-                env["PYTHONPATH"] = os.pathsep.join(
-                    [_REPO_ROOT, _QM_DIR, env.get("PYTHONPATH", "")])
                 proc = await asyncio.create_subprocess_exec(
-                    sys.executable, script_path, "--path", stage_dir,
+                    sys.executable, "-u", script_path, "--path", run_dir,
                     cwd=_QM_DIR, env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
-                seen = set()
-                while True:
-                    raw = await proc.stdout.readline()
-                    if not raw:
-                        break
-                    line = raw.decode("utf-8", "replace").rstrip()
-                    if line:
-                        print(f"[STITCH:{model_key}] {line}")
-                    for key, pct, label in _STITCH_MILESTONES:
-                        if key in line and key not in seen:
-                            seen.add(key)
-                            await emit_progress(pct, label)
-                rc = await proc.wait()
-                if rc == 0 and os.path.exists(expected):
-                    output_file = expected
-                else:
-                    fail_detail = (f"Pipeline {model_key} berakhir (exit {rc}) tanpa "
-                                   f"menghasilkan mosaik — kemungkinan overlap antar-tile "
-                                   f"terlalu kecil.")
-            except Exception as e:
-                fail_detail = f"Gagal menjalankan {model_key}: {e}"
-                print(f"[BRIDGE AI ERROR] {fail_detail}")
-        else:
-            fail_detail = f"Tile dengan posisi valid kurang dari 2 (staged={staged})."
-            print(f"[BRIDGE AI ERROR] {fail_detail}")
+            except OSError as e:
+                return None, [f"OSError: {e}"], exp
+            err_tail, seen, cur = [], set(), 14
 
-        if output_file and os.path.exists(output_file):
+            async def drain_stderr():
+                try:
+                    while True:
+                        ln = await proc.stderr.readline()
+                        if not ln:
+                            break
+                        s = ln.decode("utf-8", "replace").rstrip()
+                        if s:
+                            err_tail.append(s)
+                            if len(err_tail) > 14:
+                                err_tail.pop(0)
+                            print(f"[STITCH:{model_key}:err] {s}")
+                except Exception:
+                    pass
+            stderr_task = asyncio.create_task(drain_stderr())
+            while True:
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+                except asyncio.TimeoutError:
+                    el = int(time.time() - t0)
+                    cur = min(96, cur + 1)
+                    await emit_progress(cur, f"Memproses… (t={el}s)")
+                    if proc.returncode is not None:
+                        break
+                    continue
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    print(f"[STITCH:{model_key}] {line}")
+                for key, pct, label in _STITCH_MILESTONES:
+                    if key in line and key not in seen:
+                        seen.add(key)
+                        cur = max(cur, pct)
+                        await emit_progress(cur, label)
+            rc_ = await proc.wait()
+            try:
+                await asyncio.wait_for(stderr_task, timeout=2)
+            except Exception:
+                stderr_task.cancel()
+            return rc_, err_tail, exp
+
+        # Grid sangat besar -> kecilkan tile lebih dulu supaya panorama muat RAM.
+        run_dir = stage_dir
+        note = ""
+        if staged > _STITCH_BIG_TILES:
+            await emit_progress(11, f"{staged} tile — mengecilkan ke {int(_STITCH_BIG_SCALE*100)}% agar muat RAM")
+            n = await asyncio.to_thread(_downscale_dir, stage_dir, scaled_dir, _STITCH_BIG_SCALE)
+            if n >= 2:
+                run_dir, staged = scaled_dir, n
+                note = f" (skala {int(_STITCH_BIG_SCALE*100)}%)"
+
+        await emit_progress(14, f"Menjalankan {model_key} — {staged} tile{note}")
+        rc, err_tail, expected = await run_pipeline(run_dir)
+
+        # OOM (SIGKILL) dan belum di-scale -> coba ulang sekali pada skala kecil.
+        if rc in (-9, 137) and run_dir == stage_dir:
+            rs = min(0.55, _STITCH_BIG_SCALE)
+            await emit_progress(12, f"RAM habis (OOM) — mencoba ulang pada skala {int(rs*100)}%")
+            n = await asyncio.to_thread(_downscale_dir, stage_dir, scaled_dir, rs)
+            if n >= 2:
+                run_dir, staged = scaled_dir, n
+                note = f" (skala {int(rs*100)}%, setelah OOM)"
+                await emit_progress(14, f"Menjalankan ulang {model_key} — {staged} tile{note}")
+                rc, err_tail, expected = await run_pipeline(run_dir)
+
+        if rc == 0 and os.path.exists(expected):
             await emit_progress(98, "Mengunggah hasil")
             local_output = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
-            shutil.copy2(output_file, local_output)
-
-            with open(local_output, "rb") as img_file:
-                encoded_stitched = base64.b64encode(img_file.read()).decode('utf-8')
-
-            async with ws_lock:
-                await websocket.send(json.dumps({
-                    "event": "STITCHING_COMPLETE",
-                    "status": "SUCCESS",
-                    "image_data": f"data:image/jpeg;base64,{encoded_stitched}",
-                    "filename": "stitched_ta_output.jpg"
-                }))
+            shutil.copy2(expected, local_output)
+            with open(local_output, "rb") as f:
+                enc = base64.b64encode(f.read()).decode("utf-8")
+            try:
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "STITCHING_COMPLETE", "status": "SUCCESS",
+                        "image_data": f"data:image/jpeg;base64,{enc}",
+                        "filename": "stitched_ta_output.jpg",
+                    }))
+                print(f"[BRIDGE AI] Stitching SELESAI{note} ({int(time.time()-t0)}s).")
+            except Exception:
+                pass
         else:
-            print(f"[BRIDGE ERROR] Stitching gagal: {fail_detail}")
-            async with ws_lock:
-                await websocket.send(json.dumps({
-                    "event": "STITCHING_FAILED", "status": "ERROR",
-                    "detail": fail_detail or "Stitching gagal di Edge Device.",
-                }))
+            tail = " | ".join(err_tail[-6:])
+            if rc in (-9, 137):
+                detail = (f"RAM Jetson tidak cukup untuk {staged} tile{note} — proses dihentikan OS "
+                          f"(OOM, exit {rc}). Solusi: tutup aplikasi lain / jalankan Jetson headless, "
+                          f"turunkan STITCH_BIG_SCALE, tambah swap, atau pecah pemindaian jadi 2 sesi "
+                          f"lalu jahit kedua mosaiknya.")
+            elif rc is None:
+                detail = (f"Tidak bisa memulai proses stitching (fork gagal, RAM habis): {tail}. "
+                          f"Tutup aplikasi lain di Jetson atau jalankan headless.")
+            elif not os.path.exists(expected):
+                detail = (f"Pipeline {model_key} berakhir (exit {rc}) tanpa menghasilkan mosaik — "
+                          f"kemungkinan overlap antar-tile terlalu kecil."
+                          + (f" Pesan error: {tail}" if tail else ""))
+            else:
+                detail = f"Pipeline {model_key} gagal (exit {rc})." + (f" {tail}" if tail else "")
+            await emit_failed(detail)
+
+    except Exception as e:
+        await emit_failed(f"Kesalahan internal saat stitching: {e}")
+    finally:
+        if paused:
+            await _resume_edge_after_stitch(state)
+
+
+async def handle_ai_action(action: str, data: dict, websocket, ws_lock, state=None):
+    """Router untuk instruksi Computer Vision dan AI"""
+    if action == "START_STITCHING":
+        global _stitch_task
+        if _stitch_task is not None and not _stitch_task.done():
+            try:
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "STITCHING_FAILED", "status": "ERROR",
+                        "detail": "Sudah ada proses tile stitching yang berjalan di Edge.",
+                    }))
+            except Exception:
+                pass
+            return
+        # Jalankan sebagai task background -> receive_handler tetap membaca pesan
+        # (PING dsb.) selama subprocess berjalan bermenit-menit.
+        _stitch_task = asyncio.create_task(_run_stitch_job(data, websocket, ws_lock, state))
+        return
 
     elif action == "START_DL_COUNT":
         print("[BRIDGE AI] Menjalankan YOLO Segmentation Colony Counter (best_Seg_1280_int8)...")

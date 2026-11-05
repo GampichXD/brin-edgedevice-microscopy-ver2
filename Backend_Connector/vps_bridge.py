@@ -13,6 +13,7 @@ from Hardware.Devices.motor import motor_core
 from Hardware.Devices.camera import camera_core
 
 from Hardware.Utils.telemetry import get_jetson_temperatures, get_jetson_memory_stats
+from Hardware.Utils import edge_state
 from Hardware.Handlers.motor_handler import handle_motor_action
 from Hardware.Handlers.camera_handler import handle_camera_action
 from Hardware.Handlers.ai_handler import handle_ai_action
@@ -68,7 +69,7 @@ async def receive_handler(websocket):
             elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "PURGE_CACHE", "PURGE_ALL_DATASETS", "PURGE_DATASET_FOLDER", "PURGE_DATASET_FILES"]:
                 await handle_camera_action(action, data, websocket, ws_lock, state)
             elif action in ["START_STITCHING", "START_DL_COUNT", "APPLY_IMAGE_EDIT", "CV_COLONY_COUNT", "CV_THRESHOLD", "CV_CONTOUR", "CV_MORPHOLOGY", "CV_SOBEL", "CV_ROI", "CV_CALIBRATE", "CV_COLOR_SPLIT"]:
-                await handle_ai_action(action, data, websocket, ws_lock)
+                await handle_ai_action(action, data, websocket, ws_lock, state)
             elif action == "PING":
                 pass # Abaikan sinyal keep-alive
             else:
@@ -84,6 +85,12 @@ async def send_stream_task(websocket, state):
     while True:
         start_t = time.time()
         try:
+            # Selama tile stitching berat, kamera ditutup & RAM dihemat —
+            # jangan sentuh kamera / encode / kirim frame sama sekali.
+            if edge_state.stitching:
+                await asyncio.sleep(0.5)
+                continue
+
             if state["is_streaming"]:
                 # Ambil JPEG bytes langsung dari buffer kamera (lebih efisien, skip re-encode)
                 jpeg_bytes = camera_core.capture_jpeg_bytes()
@@ -182,7 +189,9 @@ async def telemetry_sender(websocket):
                 }))
         except Exception:
             break
-        await asyncio.sleep(0.2)
+        # Saat stitching, kirim telemetri lebih jarang (hemat CPU/GIL untuk
+        # subprocess); tetap dikirim supaya web tahu Jetson masih hidup.
+        await asyncio.sleep(1.0 if edge_state.stitching else 0.2)
 
 async def hardware_control_loop():
     print("[EDGE CONNECTOR] Menginisialisasi koneksi hardware...")
