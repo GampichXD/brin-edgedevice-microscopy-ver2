@@ -8,7 +8,7 @@ import time
 import cv2
 from datetime import datetime
 from Hardware.Devices.camera import camera_core
-from Hardware.Utils import test_logger
+from Hardware.Utils import flatfield, test_logger
 
 LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp_images"))
 if not os.path.exists(LOCAL_TMP_DIR):
@@ -17,6 +17,15 @@ if not os.path.exists(LOCAL_TMP_DIR):
 
 def _safe_session(s):
     return re.sub(r"[^A-Za-z0-9_-]", "", str(s))[:40] or "adhoc"
+
+
+def _apply_flatfield(path):
+    reference = flatfield.load_reference()
+    img = cv2.imread(path)
+    if reference is None or img is None or reference[0].shape != img.shape:
+        print("[BRIDGE CAMERA WARNING] Flat-field dilewati: referensi belum ada atau ukurannya berbeda.")
+        return
+    cv2.imwrite(path, flatfield.correct(img, *reference), [cv2.IMWRITE_JPEG_QUALITY, 95])
 
 
 def _encode_preview(src_path):
@@ -143,6 +152,9 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         if is_grid:
             print(f"[BRIDGE CAMERA] Sesi: {local_path} (dilaporkan sbg {report_name})")
 
+        if flatfield.enabled():
+            await asyncio.to_thread(_apply_flatfield, local_path)
+
         # UPLOAD KE VPS SUPAYA BISA DILIHAT DI BROWSER.
         # Kirim versi PREVIEW yang dikecilkan (bukan full-res) supaya paket
         # WebSocket kecil -> tidak menyumbat stream/telemetri saat grid besar
@@ -162,6 +174,14 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
                 }))
         except Exception as e:
             print(f"[BRIDGE ERROR] Gagal mengirim base64 image ke websocket: {e}")
+
+    elif action == "CALIBRATE_FLATFIELD":
+        mode = data.get("mode")
+        try:
+            path = await asyncio.to_thread(flatfield.capture_reference, camera_core.capture_frame, mode)
+            print(f"[BRIDGE CAMERA] Referensi flat-field '{mode}' tersimpan: {path}")
+        except Exception as e:
+            print(f"[BRIDGE CAMERA ERROR] Kalibrasi flat-field gagal: {e}")
 
     elif action == "PURGE_CACHE":
         print("[BRIDGE] 🧹 Menerima perintah PURGE_CACHE dari VPS.")

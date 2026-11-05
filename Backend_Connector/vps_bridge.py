@@ -133,7 +133,7 @@ async def command_worker(websocket, commands: asyncio.Queue):
 
             if action in ["MOVE_MOTOR", "HOMING", "UNLOCK", "SET_POSITION", "APPLY_CNC_SETTINGS", "APPLY_SOFT_LIMITS"]:
                 await handle_motor_action(action, data, websocket, ws_lock)
-            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "PURGE_CACHE", "PURGE_ALL_DATASETS", "PURGE_DATASET_FOLDER", "PURGE_DATASET_FILES"]:
+            elif action in ["APPLY_CAMERA_SETTINGS", "START_STREAM", "STOP_STREAM", "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE", "CALIBRATE_FLATFIELD", "PURGE_CACHE", "PURGE_ALL_DATASETS", "PURGE_DATASET_FOLDER", "PURGE_DATASET_FILES"]:
                 await handle_camera_action(action, data, websocket, ws_lock, state)
             elif action in ["START_STITCHING", "START_DL_COUNT", "APPLY_IMAGE_EDIT", "CV_COLONY_COUNT", "CV_THRESHOLD", "CV_CONTOUR", "CV_MORPHOLOGY", "CV_SOBEL", "CV_ROI", "CV_CALIBRATE", "CV_COLOR_SPLIT"]:
                 await handle_ai_action(action, data, websocket, ws_lock, state)

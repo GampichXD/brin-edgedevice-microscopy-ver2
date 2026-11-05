@@ -73,3 +73,6 @@ crash_log.txt
 test_logs/*
 !test_logs/.gitkeep
 test_results/
+
+# Referensi flat-field (khusus mesin ini, lihat Utils/flatfield.py)
+local_calibration/
