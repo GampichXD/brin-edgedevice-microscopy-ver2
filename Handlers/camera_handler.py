@@ -4,9 +4,11 @@ import json
 import base64
 import shutil
 import asyncio
+import time
 import cv2
 from datetime import datetime
 from Hardware.Devices.camera import camera_core
+from Hardware.Utils import test_logger
 
 LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp_images"))
 if not os.path.exists(LOCAL_TMP_DIR):
@@ -121,6 +123,7 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
 
         # Disk I/O dan encode di thread pool: event loop harus tetap bebas supaya
         # watchdog koneksi tidak salah membaca loop yang macet sebagai link putus.
+        t_capture_ns = time.time_ns()
         saved = await asyncio.to_thread(
             camera_core.save_snapshot, save_dir, prefix=prefix, coord_x=cx, coord_y=cy,
             requested_filename=local_name)
@@ -157,6 +160,10 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         try:
             frame_bytes = await asyncio.to_thread(_encode_preview, local_path)
             encoded_image = base64.b64encode(frame_bytes).decode('utf-8')
+            if is_grid:
+                test_logger.log("tiles", session=session, tile_id=report_name, grid_x=gx, grid_y=gy,
+                                t_cmd_rx_ns=data.get("_t_rx_ns", ""), t_capture_ns=t_capture_ns,
+                                bytes=os.path.getsize(local_path))
             async with ws_lock:
                 await websocket.send(json.dumps({
                     "event": "IMAGE_CAPTURED",

@@ -24,6 +24,7 @@ class IMX477CameraCore:
 
         # Threading untuk live streaming anti-blocking
         self.jpeg_frame = None   # Menyimpan JPEG bytes mentah (sudah terkompresi)
+        self.last_frame_time_ns = None  # epoch ns saat jpeg_frame terakhir diambil dari kamera
         self.started = False
         self.read_lock = threading.Lock()
         self.thread = None
@@ -235,6 +236,7 @@ class IMX477CameraCore:
                 if frame is not None:
                     with self.read_lock:
                         self.jpeg_frame = frame
+                        self.last_frame_time_ns = time.time_ns()
                 else:
                     # GStreamer mungkin putus
                     if self.proc and self.proc.poll() is not None:
@@ -256,6 +258,7 @@ class IMX477CameraCore:
                 if ret:
                     with self.read_lock:
                         self.jpeg_frame = buf.tobytes()
+                        self.last_frame_time_ns = time.time_ns()
             else:
                 time.sleep(0.02)
             time.sleep(1.0 / self.fps)

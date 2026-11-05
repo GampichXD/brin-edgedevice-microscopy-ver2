@@ -86,3 +86,25 @@ def test_mode_mock_tidak_butuh_serial(tmp_path):
     assert m.feed_hold() is True
     m.clear_hold()
     assert m.hold_latched is False
+
+
+def test_B4_cmd_csv_mencatat_waktu(tmp_path, monkeypatch):
+    import asyncio
+    import csv
+    from Hardware.Devices import motor as motor_mod
+    from Hardware.Handlers import motor_handler
+    from Hardware.Utils import test_logger
+    monkeypatch.setattr(test_logger, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("TEST_LOGGING", "1")
+    monkeypatch.setattr(motor_handler.motor_core, "jog_from_gcode", lambda g: "ok")
+
+    class Sock:
+        async def send(self, text):
+            pass
+
+    asyncio.run(motor_handler.handle_motor_action(
+        "MOVE_MOTOR", {"gcode": "G1 X0.05 F250", "cmd_id": 7, "_t_rx_ns": 123}, Sock(), asyncio.Lock()))
+    with open(tmp_path / "cmd.csv") as f:
+        row = next(csv.DictReader(f))
+    assert list(row) == ["cmd_id", "gcode", "t_rx_ns", "t_ok_ns"]
+    assert row["cmd_id"] == "7" and row["t_rx_ns"] == "123" and int(row["t_ok_ns"]) > 123

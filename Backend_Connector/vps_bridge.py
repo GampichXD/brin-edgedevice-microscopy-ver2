@@ -106,6 +106,7 @@ async def command_worker(websocket, commands: asyncio.Queue):
         message, t_rx_ns = await commands.get()
         try:
             data = json.loads(message)
+            data["_t_rx_ns"] = t_rx_ns
             action = data.get("action", "").upper()
             
             if action == "RESTART_EDGE":
@@ -173,6 +174,7 @@ async def send_stream_task(websocket, state):
 
             if state["is_streaming"]:
                 # Ambil JPEG bytes langsung dari buffer kamera (lebih efisien, skip re-encode)
+                t_read_ns = time.time_ns()
                 jpeg_bytes = camera_core.capture_jpeg_bytes()
 
                 # --- MOCK FALLBACK: Jika kamera offline, buat frame hitam ---
@@ -220,10 +222,13 @@ async def send_stream_task(websocket, state):
                 # Kirim JPEG ke VPS via WebSocket (base64)
                 if jpeg_bytes is not None:
                     base64_str = base64.b64encode(jpeg_bytes).decode('utf-8')
+                    state["frame_id"] = state.get("frame_id", 0) + 1
                     async with ws_lock:
                         await websocket.send(json.dumps({
                             "event": "STREAM_DATA",
-                            "image": f"data:image/jpeg;base64,{base64_str}"
+                            "image": f"data:image/jpeg;base64,{base64_str}",
+                            "t_cap": camera_core.last_frame_time_ns or t_read_ns,
+                            "frame_id": state["frame_id"],
                         }))
             else:
                 # Tidak streaming, tapi jika masih recording karena alasan apapun, jaga frame tetap masuk
@@ -249,13 +254,21 @@ async def telemetry_sender(websocket):
         try:
             status_data = await asyncio.to_thread(motor_core.get_status)
             mem_stats = get_jetson_memory_stats()
+            temps = get_jetson_temperatures()
+            cpu_usage = psutil.cpu_percent(interval=None)
+            if test_logger.enabled():
+                used, _, total = mem_stats["ram"].replace(" GB", "").partition("/")
+                test_logger.log("telemetry", t_ns=time.time_ns(), status=status_data["status"],
+                                x=status_data["X"], y=status_data["Y"], z=status_data["Z"], cpu=cpu_usage,
+                                cpu_temp=temps.get("cpu"), gpu_temp=temps.get("gpu"),
+                                ram_used_gb=used, ram_total_gb=total)
             async with ws_lock:
                 await websocket.send(json.dumps({
                     "event": "TELEMETRY_DATA",
                     "status": status_data["status"],
                     "limit_switch": status_data.get("limit_switch", "N/A"),
-                    "jetson_temperatures": get_jetson_temperatures(),
-                    "edge_cpu_usage": psutil.cpu_percent(interval=None),
+                    "jetson_temperatures": temps,
+                    "edge_cpu_usage": cpu_usage,
                     "ram_usage": mem_stats["ram"],
                     "rom_usage": mem_stats["rom"],
                     "position": {
@@ -271,7 +284,13 @@ async def telemetry_sender(websocket):
             break
         # Saat stitching, kirim telemetri lebih jarang (hemat CPU/GIL untuk
         # subprocess); tetap dikirim supaya web tahu Jetson masih hidup.
-        await asyncio.sleep(1.0 if edge_state.stitching else 0.2)
+        if edge_state.stitching:
+            await asyncio.sleep(1.0)
+        elif test_logger.enabled():
+            # Saat uji, interval dirapatkan supaya waktu berhenti motor terukur halus.
+            await asyncio.sleep(float(os.getenv("TEST_TELEMETRY_INTERVAL", "0.05")))
+        else:
+            await asyncio.sleep(0.2)
 
 async def hardware_control_loop():
     print("[EDGE CONNECTOR] Menginisialisasi koneksi hardware...")

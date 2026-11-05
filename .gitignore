@@ -68,3 +68,8 @@ overlap_metrics*.csv
 
 # ── Log crash ──
 crash_log.txt
+
+# Data uji mentah dan hasil analisis (lihat Testing/README.md)
+test_logs/*
+!test_logs/.gitkeep
+test_results/

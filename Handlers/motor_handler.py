@@ -1,6 +1,8 @@
 import json
 import asyncio
+import time
 from Hardware.Devices.motor import motor_core
+from Hardware.Utils import test_logger
 
 async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
     """Router untuk instruksi mekanika CNC/Motor.
@@ -11,7 +13,10 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         gcode = data.get("gcode", "")
         print(f"[BRIDGE] Eksekusi G-Code: {gcode}")
         # Jalankan operasi serial blocking di thread pool
+        t_rx_ns = data.get("_t_rx_ns") or time.time_ns()
         grbl_resp = await asyncio.to_thread(motor_core.jog_from_gcode, gcode)
+        test_logger.log("cmd", cmd_id=data.get("cmd_id", ""), gcode=gcode,
+                        t_rx_ns=t_rx_ns, t_ok_ns=time.time_ns())
         
         async with ws_lock:
             await websocket.send(json.dumps({
