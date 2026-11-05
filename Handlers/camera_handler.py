@@ -46,7 +46,7 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         if not state["is_recording"]:
             state["is_recording"] = True
             state["is_streaming"] = True  # Pastikan stream aktif agar frame mengalir ke VideoWriter
-            folder_id = data.get("folder_id", "unsorted")
+            folder_id = _safe_session(data.get("folder_id") or "unsorted")
             # ABSOLUT relatif ke Hardware/local_datasets (bukan CWD) — sama dengan
             # yang dipantau vps_syncer.py, jadi video pasti ke-sync ke VPS.
             rec_dir = os.path.abspath(os.path.join(

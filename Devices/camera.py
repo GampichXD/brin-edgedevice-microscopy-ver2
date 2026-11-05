@@ -6,7 +6,10 @@ import time
 import subprocess
 import struct
 import atexit
+import re
 from datetime import datetime
+
+SAFE_CAPTURE_NAME = re.compile(r"[A-Za-z0-9._-]+\.(jpg|jpeg|png)")
 
 class IMX477CameraCore:
     def __init__(self, sensor_id=0, width=1280, height=720, fps=30):
@@ -333,7 +336,10 @@ class IMX477CameraCore:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        if requested_filename:
+        # Nama dari luar disaring: tidak boleh menulis di luar output_dir. Kalau tidak
+        # cocok, pakai nama otomatis (VPS menangani tile yang tak kunjung tiba).
+        requested_filename = os.path.basename(str(requested_filename)) if requested_filename else None
+        if requested_filename and SAFE_CAPTURE_NAME.fullmatch(requested_filename):
             filename = requested_filename
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

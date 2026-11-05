@@ -117,6 +117,7 @@ def _resolve_tile_source(t, session=None):
     (c) unduh dari URL publik VPS                   ('Input Images' database/upload)."""
     t = t or {}
     fname = t.get("filename")
+    fname = os.path.basename(str(fname)) if fname else None
     gx, gy = t.get("gridX"), t.get("gridY")
 
     if session and gx is not None and gy is not None:
