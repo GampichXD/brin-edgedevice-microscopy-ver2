@@ -21,11 +21,12 @@ def burst_rest(base, headers, args):
         value = args.step if i % 2 == 0 else -args.step
         res = requests.post(f"{base}/api/hardware/motor/move", headers=headers, timeout=15, json={
             "axis": "X", "value": value, "feed_rate": 250.0, "unit": "mm"})
-        ok = res.status_code == 200
-        accepted += ok
-        rejected += res.status_code == 429
+        # Yang diuji hanya guard rate-limit: 409 berarti lolos guard, tetapi CNC belum tersambung.
+        limited = res.status_code == 429
+        accepted += not limited
+        rejected += limited
         append_row(args.log_dir, "ratelimit", t_send_ns=t_send, channel="rest",
-                   result="ACCEPTED" if ok else "REJECTED")
+                   result="REJECTED" if limited else "ACCEPTED")
         time.sleep(max(0.0, 1.0 / args.rate - (time.time_ns() - t_send) / 1e9))
     print(f"REST: {accepted} diterima, {rejected} ditolak")
 
@@ -37,7 +38,7 @@ async def burst_ws(base, token, args):
         async def reader():
             while True:
                 message = json.loads(await ws.recv())
-                if message.get("event") == "COMMAND_REJECTED":
+                if message.get("event") == "COMMAND_REJECTED" and message.get("reason") == "RATE_LIMIT":
                     rejected_ids.add(message.get("cmd_id"))
 
         task = asyncio.create_task(reader())
