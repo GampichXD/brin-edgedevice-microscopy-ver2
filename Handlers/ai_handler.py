@@ -7,12 +7,12 @@ import glob
 import re
 import shutil
 import asyncio
+import subprocess
 from Hardware.Utils import edge_state
 try:
     import requests
 except ImportError:
     requests = None
-from Hardware.Computer_Vision.Quantize_model.colony_counting import count_colonies
 from Hardware.Computer_Vision.classic_cv_edit import classic_cv_editor
 
 LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp_images"))
@@ -79,6 +79,10 @@ _STITCH_MILESTONES = [
 # Bobot YOLO segmentation TensorRT (INT8) untuk perhitungan koloni -- lihat
 # Quantize_model/Weights/yolo_model/. .engine tidak menyimpan metadata task
 # seperti .pt, jadi task='segment' selalu di-pass eksplisit di bawah.
+COLONY_SCRIPT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "Computer_Vision", "Quantize_model", "colony_counting.py"
+))
+COLONY_TIMEOUT_S = 300
 YOLO_SEG_MODEL = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "Computer_Vision", "Quantize_model",
     "Weights", "yolo_model", "best_Seg_1280_int8.engine"
@@ -218,8 +222,22 @@ def _run_colony_count(input_path, output_dir, conf=0.25):
     downstream (event WebSocket, file JSON di static/uploads) tetap sama.
     Return (legacy_filename, count) -- meniru signature colony_counter lama.
     """
-    result = count_colonies(input_path, YOLO_SEG_MODEL, output_dir=output_dir,
-                            conf=conf, task="segment", save_annotated=True)
+    # Proses terpisah, sama seperti stitching: kehabisan memori GPU di TensorRT mematikan
+    # proses secara langsung tanpa exception Python. Di proses utama, itu berarti koneksi
+    # VPS, kamera, dan motor ikut mati. Memori GPU juga kembali bebas setelah selesai.
+    os.makedirs(output_dir, exist_ok=True)
+    done = subprocess.run(
+        [sys.executable, "-u", COLONY_SCRIPT, "--image", input_path, "--model", YOLO_SEG_MODEL,
+         "--output-dir", output_dir, "--conf", str(conf), "--task", "segment"],
+        capture_output=True, text=True, timeout=COLONY_TIMEOUT_S)
+    if done.returncode != 0:
+        tail = " ".join((done.stderr or done.stdout).strip().splitlines()[-3:])
+        if "out of memory" in (done.stdout + done.stderr).lower() or "NVML_SUCCESS" in done.stderr:
+            tail = "Memori GPU Jetson tidak cukup. Tutup aplikasi lain lalu coba lagi. " + tail
+        raise RuntimeError(f"Colony counting gagal (rc={done.returncode}): {tail[-400:]}")
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    with open(os.path.join(output_dir, f"{stem}_colonies.json")) as f:
+        result = json.load(f)
 
     legacy_filename = "yolo_" + os.path.basename(input_path)
     legacy_path = os.path.join(output_dir, legacy_filename)

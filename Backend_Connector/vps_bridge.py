@@ -68,6 +68,14 @@ class LinkState:
         return (time.monotonic() - self.last_rx) * 1000.0
 
 
+_link_lost_since_connect = False
+
+
+def _set_link_ok() -> None:
+    global _link_lost_since_connect
+    _link_lost_since_connect = False
+
+
 def _log_watchdog(event: str, age_ms: float) -> None:
     test_logger.log("watchdog_log", always=True, t_ns=time.time_ns(), event=event,
                     last_rx_age_ms=round(age_ms, 1), motor_state=motor_core.last_status)
@@ -78,6 +86,8 @@ def _hold_motor(link: LinkState, event: str) -> None:
     hanya lewat perintah baru, yang akan melepas Hold (lihat GRBLMotorCore.clear_hold)."""
     if link.hold_sent:
         return
+    global _link_lost_since_connect
+    _link_lost_since_connect = True
     link.hold_sent = True
     age = link.age_ms()
     _log_watchdog(event, age)
@@ -94,6 +104,7 @@ async def receive_handler(websocket, link: LinkState, commands: asyncio.Queue):
         if link.hold_sent:
             link.hold_sent = False
             _log_watchdog("LINK_RESTORED", 0.0)
+            _set_link_ok()
         if message == PING_MESSAGE:
             link.armed = True
             continue
@@ -304,10 +315,14 @@ async def hardware_control_loop():
     while True:
         try:
             link = LinkState()
+            link_was_lost = _link_lost_since_connect
             async with websockets.connect(_edge_ws_url(), max_size=None,
                                           ping_interval=WS_PING_INTERVAL,
                                           ping_timeout=WS_PING_TIMEOUT) as websocket:
                 print("[EDGE SUCCESS] Pipa jaringan asinkron ganda terhubung penuh!")
+                if link_was_lost:
+                    _log_watchdog("LINK_RESTORED", 0.0)
+                    _set_link_ok()
                 async with ws_lock:
                     await websocket.send(json.dumps({"status": "READY", "device": "JETSON_ORIN_NANO"}))
 
