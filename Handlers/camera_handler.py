@@ -206,15 +206,22 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         if folder_id and os.path.isdir(target_dir):
             existing = set(os.listdir(target_dir))
             for fn in filenames:
-                base = os.path.basename(str(fn))
-                # cocokkan nama persis ATAU prefix (vps sering menambah _timestamp)
+                base = os.path.basename(str(fn or ""))
+                if not base:
+                    continue
+                # Nama persis, atau varian bertimestamp dari /add-images di VPS
+                # (<stem>_YYYYmmdd_HHMMSS<ext>). tile.jpg TIDAK boleh ikut menghapus
+                # tile_r0_c0.jpg. Marker .synced ikut dihapus bersama berkasnya.
                 stem, ext = os.path.splitext(base)
-                for cand in list(existing):
-                    if cand == base or cand.startswith(stem + "_") or cand == stem + ext:
+                stamped = re.compile(rf"{re.escape(stem)}_\d{{8}}_\d{{6}}{re.escape(ext)}")
+                for cand in sorted(existing):
+                    target = cand[:-len(".synced")] if cand.endswith(".synced") else cand
+                    if target == base or stamped.fullmatch(target):
                         try:
                             os.remove(os.path.join(target_dir, cand))
                             existing.discard(cand)
                             removed += 1
+                            print(f"[BRIDGE] 🧹 PURGE_DATASET_FILES: {cand} dihapus.")
                         except Exception:
                             pass
         print(f"[BRIDGE] 🧹 PURGE_DATASET_FILES: {removed} file dihapus dari {target_dir}.")
