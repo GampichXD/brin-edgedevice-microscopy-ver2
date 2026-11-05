@@ -196,6 +196,20 @@ class GRBLMotorCore:
                 return f"{ax}{v:.3f}"
             clean_cmd = re.sub(r"([XYZxyz])\s*(-?[\d.]+)", _clamp_match, clean_cmd)
 
+        # Gerak relatif: batas dihitung dari target = posisi terakhir + delta per sumbu.
+        elif (self.soft_limits_enabled and self.is_relative_mode
+                and clean_cmd.upper().startswith(("G0 ", "G1 "))):
+            def _clamp_delta(mobj):
+                ax = mobj.group(1).upper()
+                cur = float(self.last_known_pos.get(ax, 0.0))
+                v, hit = self._clamp_axis(ax, cur + float(mobj.group(2)))
+                if hit == 0:
+                    return mobj.group(0)
+                print(f"[CORE MOTOR] Soft limit {('-' if hit < 0 else '+')}{ax} "
+                      f"— gerak relatif dipotong ke {v:.3f}")
+                return f"{ax}{v - cur:.3f}"
+            clean_cmd = re.sub(r"([XYZxyz])\s*(-?[\d.]+)", _clamp_delta, clean_cmd)
+
         if self.is_mock_mode:
             print(f"[MOCK MOTOR] Menembak: {clean_cmd} -> Balasan: ok")
             self._track_position_from_gcode(clean_cmd)
