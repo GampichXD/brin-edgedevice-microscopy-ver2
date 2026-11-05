@@ -22,6 +22,12 @@ VPS_BASE_URL = os.getenv("VPS_BASE_URL", "http://localhost:8000/api/dataset")
 # Interval sinkronisasi dalam detik
 SYNC_INTERVAL = 10
 
+
+def _edge_headers():
+    """Endpoint dataset di VPS mewajibkan autentikasi; Jetson memakai device token."""
+    token = os.getenv("EDGE_DEVICE_TOKEN", "")
+    return {"X-Edge-Token": token} if token else {}
+
 def sync_datasets():
     # Rem total selama tile stitching berat: hindari requests.post file besar +
     # I/O disk yang berebut RAM/CPU dengan subprocess stitching.
@@ -71,7 +77,7 @@ def sync_datasets():
                         else:
                             mime_type = 'image/jpeg'
                         files = {'files': (file_name, f, mime_type)}
-                        response = requests.post(sync_url, files=files, timeout=30)
+                        response = requests.post(sync_url, files=files, headers=_edge_headers(), timeout=30)
                         
                     if response.status_code == 200:
                         # Jika berhasil, buat file marker kosong agar tidak diupload berulang kali
@@ -89,7 +95,7 @@ def sync_datasets():
     server_folders = None
     try:
         index_url = f"{VPS_BASE_URL}/vps/sync-index"
-        res = requests.get(index_url, timeout=10)
+        res = requests.get(index_url, headers=_edge_headers(), timeout=10)
         if res.status_code == 200:
             server_folders = res.json().get("folders", {})
             for folder_id, data in server_folders.items():
@@ -102,7 +108,7 @@ def sync_datasets():
                     if not os.path.exists(local_file_path):
                         print(f"[SYNCER DOWNSTREAM] Mengunduh cermin baru dari Server: {file_name} ke folder {folder_id}...")
                         download_url = f"{VPS_BASE_URL}/folders/{folder_id}/files/{file_name}/download"
-                        with requests.get(download_url, stream=True, timeout=30) as r:
+                        with requests.get(download_url, stream=True, headers=_edge_headers(), timeout=30) as r:
                             if r.status_code == 200:
                                 with open(local_file_path, 'wb') as f:
                                     for chunk in r.iter_content(chunk_size=8192):
