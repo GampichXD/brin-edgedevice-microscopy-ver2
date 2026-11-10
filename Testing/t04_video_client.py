@@ -11,14 +11,15 @@ import time
 
 import websockets
 
-from common import DEFAULT_LOG_DIR, append_row, client_ws_url, heartbeat_loop, login, percentile
+from common import KEEPALIVE_TIMEOUT_S, DEFAULT_LOG_DIR, append_row, client_ws_url, heartbeat_loop, login, percentile
 
 
 async def run(args):
     base, token = login()
     latencies, frames = [], 0
     deadline = time.monotonic() + args.duration
-    async with websockets.connect(client_ws_url(base, token), max_size=None) as ws:
+    async with websockets.connect(client_ws_url(base, token), max_size=None,
+                                  ping_interval=20, ping_timeout=KEEPALIVE_TIMEOUT_S) as ws:
         beat = asyncio.create_task(heartbeat_loop(ws))
         await ws.send(json.dumps({"action": "START_STREAM"}))
         try:

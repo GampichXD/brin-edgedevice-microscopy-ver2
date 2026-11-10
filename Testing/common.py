@@ -9,6 +9,9 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_LOG_DIR = os.path.join(ROOT, "test_logs")
 HEARTBEAT_INTERVAL_S = 20  # tanpa HEARTBEAT, server memutus klien setelah 90 detik
+# Pong bisa tertahan di belakang frame video saat Wi-Fi penuh. Batas bawaan 20 detik
+# memutus klien uji padahal koneksinya masih jalan.
+KEEPALIVE_TIMEOUT_S = 120
 
 
 def append_row(log_dir, name, **fields):
@@ -115,7 +118,7 @@ async def connect_as_pilot(url, timeout=10.0):
     """Buka WebSocket klien dengan peran PILOT. Akun ADMIN otomatis mengambil alih kursi."""
     import websockets
 
-    ws = await websockets.connect(url, max_size=None)
+    ws = await websockets.connect(url, max_size=None, ping_interval=20, ping_timeout=KEEPALIVE_TIMEOUT_S)
     deadline = time.monotonic() + timeout
     role = None
     while time.monotonic() < deadline:
