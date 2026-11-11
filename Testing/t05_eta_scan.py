@@ -19,6 +19,7 @@ from common import DEFAULT_LOG_DIR, append_row, auth_headers, client_ws_url, con
 # ── Salinan dari Software/backend/app/services/scan_planner.py. Ubah keduanya bersamaan. ──
 MIN_MOVE_DELAY_S = 0.5
 ROW_CHANGE_SETTLE_S = 1.0
+CAPTURE_OVERHEAD_S = 0.43
 
 
 def plan_serpentine(rows, cols, x0, y0, dx, dy):
@@ -36,11 +37,11 @@ def compute_delay(distance_mm, feed_mm_per_s, delay_ms, row_change=False, row_se
 # ─────────────────────────────────────────────────────────────────────────────────────
 
 
-def predict_seconds(rows, cols, step, feed_mm_min, delay_ms):
+def predict_seconds(rows, cols, step, feed_mm_min, delay_ms, capture_s=CAPTURE_OVERHEAD_S):
     total, last_x, last_y = 0.0, 0.0, 0.0
     for tile in plan_serpentine(rows, cols, 0.0, 0.0, step, step):
         distance = math.hypot(tile["x"] - last_x, tile["y"] - last_y)
-        total += compute_delay(distance, feed_mm_min / 60.0, delay_ms, tile["row_change"])
+        total += compute_delay(distance, feed_mm_min / 60.0, delay_ms, tile["row_change"]) + capture_s
         last_x, last_y = tile["x"], tile["y"]
     return total
 
