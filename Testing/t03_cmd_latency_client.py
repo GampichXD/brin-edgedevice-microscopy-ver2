@@ -19,6 +19,18 @@ async def run(args):
     base, token = login()
     ws = await connect_as_pilot(client_ws_url(base, token))
     async with ws:
+        rejected = {}
+
+        async def reader():
+            # Catat penolakan server; tanpa ini perintah yang ditolak hilang tanpa jejak.
+            while True:
+                m = json.loads(await ws.recv())
+                if m.get("event") == "COMMAND_REJECTED":
+                    rejected[m.get("cmd_id")] = m.get("reason")
+                elif m.get("event") == "ROLE_ASSIGNED" and m.get("role") != "PILOT":
+                    print(f"Peringatan: peran berubah menjadi {m.get('role')}")
+
+        reader_task = asyncio.create_task(reader())
         start_id = int(time.time()) * 1000  # unik antar-sesi supaya penggabungan cmd_id tidak bentrok
         for i in range(args.count):
             value = args.step if i % 2 == 0 else -args.step
@@ -28,6 +40,13 @@ async def run(args):
                 "action": "MOVE_MOTOR", "gcode": f"G1 X{value:.3f} F250", "cmd_id": cmd_id, "t_sent": t_sent}))
             append_row(args.log_dir, "cmd_client", cmd_id=cmd_id, path=args.path, t_sent_ns=t_sent)
             await asyncio.sleep(args.interval)
+        await asyncio.sleep(2)
+        reader_task.cancel()
+    if rejected:
+        reasons = {}
+        for r in rejected.values():
+            reasons[r] = reasons.get(r, 0) + 1
+        print(f"{len(rejected)} perintah ditolak server: {reasons}")
     print(f"{args.count} perintah terkirim lewat jalur {args.path}. Salin cmd.csv dari Jetson ke {args.log_dir}.")
 
 

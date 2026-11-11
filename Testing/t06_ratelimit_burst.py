@@ -15,20 +15,47 @@ from common import DEFAULT_LOG_DIR, append_row, auth_headers, client_ws_url, con
 
 
 def burst_rest(base, headers, args):
-    accepted = rejected = 0
-    for i in range(int(args.rate * args.duration)):
-        t_send = time.time_ns()
+    """Kirim tepat `rate` request per detik secara paralel. Menunggu balasan satu per satu
+    membuat laju turun ke ~2-3/detik (waktu bolak-balik lewat Cloudflare), sehingga bukan burst."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    session = requests.Session()
+
+    def one(i, t_send):
         value = args.step if i % 2 == 0 else -args.step
-        res = requests.post(f"{base}/api/hardware/motor/move", headers=headers, timeout=15, json={
-            "axis": "X", "value": value, "feed_rate": 250.0, "unit": "mm"})
-        # Yang diuji hanya guard rate-limit: 409 berarti lolos guard, tetapi CNC belum tersambung.
-        limited = res.status_code == 429
-        accepted += not limited
-        rejected += limited
-        append_row(args.log_dir, "ratelimit", t_send_ns=t_send, channel="rest",
-                   result="REJECTED" if limited else "ACCEPTED")
-        time.sleep(max(0.0, 1.0 / args.rate - (time.time_ns() - t_send) / 1e9))
-    print(f"REST: {accepted} diterima, {rejected} ditolak")
+        try:
+            res = session.post(f"{base}/api/hardware/motor/move", headers=headers, timeout=15, json={
+                "axis": "X", "value": value, "feed_rate": 250.0, "unit": "mm"})
+            return t_send, res.status_code
+        except requests.RequestException:
+            return t_send, 0
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        t0 = time.monotonic()
+        for i in range(int(args.rate * args.duration)):
+            delay = t0 + i / args.rate - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            futures.append(pool.submit(one, i, time.time_ns()))
+        results = [f.result() for f in futures]
+
+    accepted = rejected = 0
+    other = {}
+    for t_send, code in results:
+        # 429 = ditolak rate-limit, 200 = diterima. Kode lain (403 bukan Pilot, 409 CNC offline,
+        # 0 gagal jaringan) bukan hasil guard rate-limit, dicatat apa adanya dan tidak dihitung.
+        if code == 429:
+            rejected += 1
+            result = "REJECTED"
+        elif code == 200:
+            accepted += 1
+            result = "ACCEPTED"
+        else:
+            result = f"HTTP_{code}"
+            other[code] = other.get(code, 0) + 1
+        append_row(args.log_dir, "ratelimit", t_send_ns=t_send, channel="rest", result=result)
+    print(f"REST: {accepted} diterima, {rejected} ditolak" + (f", kode lain {other}" if other else ""))
 
 
 async def burst_ws(base, token, args):
@@ -64,7 +91,14 @@ def main():
     args = parser.parse_args()
 
     base, token = login()
-    burst_rest(base, auth_headers(token), args)
+
+    async def rest_as_pilot():
+        # REST motor/move mewajibkan kursi Pilot: pegang WebSocket Pilot selama burst REST.
+        ws = await connect_as_pilot(client_ws_url(base, token))
+        async with ws:
+            await asyncio.get_running_loop().run_in_executor(None, burst_rest, base, auth_headers(token), args)
+
+    asyncio.run(rest_as_pilot())
     time.sleep(1)
     asyncio.run(burst_ws(base, token, args))
 
