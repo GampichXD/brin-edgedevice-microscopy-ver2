@@ -271,33 +271,39 @@ def telemetry(df, out, R):
 # ------------------------------------------------------------------ D7 watchdog
 def watchdog(wd, tel, out, R):
     trig = wd[wd["event"] == "WATCHDOG_TRIGGERED"].copy()
+    # Pemicu dengan umur pesan < 1 s terjadi tepat setelah link pulih lalu putus lagi (Wi-Fi baru
+    # menyala); motor sudah Hold dari pemicu sebelumnya, jadi bukan percobaan baru.
+    flaps = int((trig["last_rx_age_ms"] < 1000).sum())
+    trig = trig[trig["last_rx_age_ms"] >= 1000]
     if trig.empty:
         return None
+    holds = wd[wd["event"] == "FEED_HOLD_SENT"]["t_ns"].sort_values().to_numpy()
     rows = []
     for _, r in trig.iterrows():
         t_last_rx = r["t_ns"] - r["last_rx_age_ms"] * 1e6
-        detect_ms = r["last_rx_age_ms"]
-        stop_ms = np.nan
-        if tel is not None:
-            after = tel[(tel["t_ns"] >= r["t_ns"]) & (tel["status"].str.startswith("Hold") | (tel["status"] == "Idle"))]
-            if len(after):
-                stop_ms = (after["t_ns"].iloc[0] - t_last_rx) / 1e6
-        rows.append({"detect_ms": detect_ms, "stop_ms": stop_ms})
+        # Waktu berhenti diukur dari FEED_HOLD_SENT: telemetri tidak tercatat selama link putus.
+        nxt = holds[holds >= r["t_ns"]]
+        hold_ms = (nxt[0] - t_last_rx) / 1e6 if len(nxt) else np.nan
+        rows.append({"detect_ms": r["last_rx_age_ms"], "hold_ms": hold_ms, "moving": r.get("motor_state") == "Run"})
     d = pd.DataFrame(rows)
-    res = {"n": int(len(d)), "detect_ms": _stats(d["detect_ms"]), "stop_ms": _stats(d["stop_ms"])}
+    res = {"n": int(len(d)), "n_moving": int(d["moving"].sum()), "flaps_excluded": flaps,
+           "detect_ms": _stats(d["detect_ms"]), "hold_ms": _stats(d["hold_ms"])}
     fig, ax = plt.subplots(figsize=(6, 3.6))
-    ax.hist(d["stop_ms"].dropna(), bins=12, color=C2, alpha=0.85, label="Koneksi putus → motor berhenti")
-    ax.hist(d["detect_ms"], bins=12, color=C1, alpha=0.6, label="Koneksi putus → watchdog terpicu")
+    ax.hist(d["detect_ms"], bins=12, color=C1, alpha=0.85, label="Pesan terakhir → watchdog terpicu")
+    ax.axvline(3000, color=C2, ls="--", lw=1, label="WATCHDOG_TIMEOUT = 3 s")
     ax.set_xlabel("Waktu (ms)"); ax.set_ylabel("Jumlah percobaan"); ax.set_title(f"Uji watchdog keep-alive (n = {len(d)})")
     ax.legend()
     _save(fig, out, "D7_watchdog.png")
     R.append("## D7. Uji Watchdog Keep-Alive (fail-safe)\n")
+    R.append(f"{res['n']} percobaan ({res['n_moving']} saat motor bergerak). {flaps} pemicu ulang saat Wi-Fi "
+             "tersambung-putus kembali tidak dihitung. Waktu berhenti diukur dari `FEED_HOLD_SENT` karena "
+             "telemetri tidak tercatat selama koneksi putus.\n")
     R.append("| Metrik | n | Rata-rata (ms) | SD | p95 | Maks |")
     R.append("|---|---|---|---|---|---|")
-    for k, lab in [("detect_ms", "Putus → watchdog terpicu"), ("stop_ms", "Putus → motor berhenti")]:
-        s = res[k]
-        if s:
-            R.append(f"| {lab} | {s['n']} | {s['mean']:.0f} | {s['sd']:.0f} | {s['p95']:.0f} | {s['max']:.0f} |")
+    for k, lab in [("detect_ms", "Pesan terakhir → watchdog terpicu"), ("hold_ms", "Pesan terakhir → feed hold terkirim")]:
+        s_ = res[k]
+        if s_:
+            R.append(f"| {lab} | {s_['n']} | {s_['mean']:.0f} | {s_['sd']:.0f} | {s_['p95']:.0f} | {s_['max']:.0f} |")
     R.append("")
     return res
 
