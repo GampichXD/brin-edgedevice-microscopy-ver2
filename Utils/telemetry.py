@@ -24,7 +24,7 @@ def get_jetson_temperatures():
 
 def get_jetson_memory_stats():
     # ROM / Disk Usage
-    rom_str = "2.10/50.00 GB"
+    rom_str = "N/A"
     try:
         total_d, used_d, _ = shutil.disk_usage("/")
         rom_used_gb = used_d / (1024**3)
@@ -34,7 +34,7 @@ def get_jetson_memory_stats():
         pass
         
     # RAM Usage
-    ram_str = "5.12/7.62 GB"
+    ram_str = "N/A"
     try:
         if os.path.exists("/proc/meminfo"):
             with open("/proc/meminfo", "r") as f:

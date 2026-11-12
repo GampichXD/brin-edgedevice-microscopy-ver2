@@ -3,6 +3,13 @@ import time
 import requests
 from glob import glob
 
+try:
+    from Hardware.Utils import edge_state
+except Exception:  # dijalankan mandiri tanpa package root
+    class _ES:  # noqa: N801
+        stitching = False
+    edge_state = _ES()
+
 # Konfigurasi: 
 # Ambil lokasi absolut dari file script ini (Backend_Connector)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,9 +22,21 @@ VPS_BASE_URL = os.getenv("VPS_BASE_URL", "http://localhost:8000/api/dataset")
 # Interval sinkronisasi dalam detik
 SYNC_INTERVAL = 10
 
+
+def _edge_headers():
+    """Endpoint dataset di VPS mewajibkan autentikasi; Jetson memakai device token."""
+    token = os.getenv("EDGE_DEVICE_TOKEN", "")
+    return {"X-Edge-Token": token} if token else {}
+
 def sync_datasets():
+    # Rem total selama tile stitching berat: hindari requests.post file besar +
+    # I/O disk yang berebut RAM/CPU dengan subprocess stitching.
+    if getattr(edge_state, "stitching", False):
+        print("[SYNCER] Ditunda — tile stitching sedang berjalan.")
+        return
+
     print(f"[SYNCER] Memantau direktori lokal Jetson: {DATASET_DIR}")
-    
+
     if not os.path.exists(DATASET_DIR):
         print("[SYNCER] Direktori dataset belum terbentuk. Menunggu...")
         return
@@ -27,7 +46,8 @@ def sync_datasets():
     # =========================================================================
     for folder_name in os.listdir(DATASET_DIR):
         folder_path = os.path.join(DATASET_DIR, folder_name)
-        if not os.path.isdir(folder_path):
+        # Nama berawalan '_' adalah folder kerja (mis. _stage_scaled_*), bukan dataset.
+        if not os.path.isdir(folder_path) or folder_name.startswith("_"):
             continue
             
         # Temukan semua file media (gambar dan video) di dalam folder ini
@@ -58,13 +78,17 @@ def sync_datasets():
                         else:
                             mime_type = 'image/jpeg'
                         files = {'files': (file_name, f, mime_type)}
-                        response = requests.post(sync_url, files=files, timeout=30)
+                        response = requests.post(sync_url, files=files, headers=_edge_headers(), timeout=30)
                         
                     if response.status_code == 200:
                         # Jika berhasil, buat file marker kosong agar tidak diupload berulang kali
                         with open(synced_marker, 'w') as marker:
                             marker.write("SYNCED_OK")
                         print(f"[SYNCER UPSTREAM] SUKSES! File {file_name} telah di-backup ke VPS.")
+                    elif response.status_code == 404:
+                        # Folder tidak dikenal VPS: file lain di folder ini pasti ditolak juga.
+                        print(f"[SYNCER UPSTREAM] Folder {folder_name} tidak ada di VPS, dilewati pada siklus ini.")
+                        break
                     else:
                         print(f"[SYNCER UPSTREAM] GAGAL mengunggah {file_name}. Server VPS merespon: {response.status_code}")
                 except requests.exceptions.RequestException as e:
@@ -76,20 +100,27 @@ def sync_datasets():
     server_folders = None
     try:
         index_url = f"{VPS_BASE_URL}/vps/sync-index"
-        res = requests.get(index_url, timeout=10)
+        res = requests.get(index_url, headers=_edge_headers(), timeout=10)
         if res.status_code == 200:
             server_folders = res.json().get("folders", {})
             for folder_id, data in server_folders.items():
+                folder_id = os.path.basename(str(folder_id))
+                if folder_id in ("", ".", ".."):
+                    continue
                 local_folder_path = os.path.join(DATASET_DIR, folder_id)
                 os.makedirs(local_folder_path, exist_ok=True)
                 
                 for file_name in data.get("files", []):
+                    # Nama dari index server tidak boleh keluar dari folder dataset.
+                    file_name = os.path.basename(str(file_name))
+                    if file_name in ("", ".", ".."):
+                        continue
                     local_file_path = os.path.join(local_folder_path, file_name)
                     # Jika file dari server belum ada di hard disk fisik Jetson
                     if not os.path.exists(local_file_path):
                         print(f"[SYNCER DOWNSTREAM] Mengunduh cermin baru dari Server: {file_name} ke folder {folder_id}...")
                         download_url = f"{VPS_BASE_URL}/folders/{folder_id}/files/{file_name}/download"
-                        with requests.get(download_url, stream=True, timeout=30) as r:
+                        with requests.get(download_url, stream=True, headers=_edge_headers(), timeout=30) as r:
                             if r.status_code == 200:
                                 with open(local_file_path, 'wb') as f:
                                     for chunk in r.iter_content(chunk_size=8192):
@@ -105,7 +136,9 @@ def sync_datasets():
     # =========================================================================
     # STEP 3: AUTO-CLEANUP (Retensi 7 Hari untuk File Yatim)
     # =========================================================================
-    if server_folders is not None:
+    # Index kosong bisa berarti backend baru atau database lokal saat pengujian, bukan
+    # berarti semua dataset sudah dihapus: jangan pernah dijadikan dasar menghapus.
+    if server_folders:
         current_time = time.time()
         seven_days_sec = 7 * 24 * 3600
         
@@ -138,6 +171,9 @@ def sync_datasets():
                             os.remove(synced_marker)
 
 def run_daemon():
+    if os.getenv("SYNC_DISABLED", "0") == "1":
+        print("[SYNCER] SYNC_DISABLED=1: sinkronisasi dataset dimatikan.")
+        return
     print("="*50)
     print("HYBRID SYNC DAEMON AKTIF")
     print("="*50)

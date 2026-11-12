@@ -1,6 +1,12 @@
 import json
 import asyncio
+import time
 from Hardware.Devices.motor import motor_core
+from Hardware.Utils import test_logger
+
+def _result_status(grbl_resp) -> str:
+    return "ERROR" if str(grbl_resp).startswith("ERROR") else "SUCCESS"
+
 
 async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
     """Router untuk instruksi mekanika CNC/Motor.
@@ -11,12 +17,15 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         gcode = data.get("gcode", "")
         print(f"[BRIDGE] Eksekusi G-Code: {gcode}")
         # Jalankan operasi serial blocking di thread pool
+        t_rx_ns = data.get("_t_rx_ns") or time.time_ns()
         grbl_resp = await asyncio.to_thread(motor_core.jog_from_gcode, gcode)
+        test_logger.log("cmd", cmd_id=data.get("cmd_id", ""), gcode=gcode,
+                        t_rx_ns=t_rx_ns, t_ok_ns=time.time_ns())
         
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
-                "status": "SUCCESS",
+                "status": _result_status(grbl_resp),
                 "grbl_response": grbl_resp
             }))
 
@@ -26,7 +35,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
-                "status": "SUCCESS",
+                "status": _result_status(grbl_resp),
                 "grbl_response": grbl_resp
             }))
 
@@ -36,7 +45,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         async with ws_lock:
             await websocket.send(json.dumps({
                 "event": "MOTOR_MOVED",
-                "status": "SUCCESS",
+                "status": _result_status(grbl_resp),
                 "grbl_response": grbl_resp
             }))
 
@@ -47,7 +56,7 @@ async def handle_motor_action(action: str, data: dict, websocket, ws_lock):
         )
         async with ws_lock:
             await websocket.send(json.dumps({
-                "event": "MOTOR_MOVED", "status": "SUCCESS", "grbl_response": grbl_resp
+                "event": "MOTOR_MOVED", "status": _result_status(grbl_resp), "grbl_response": grbl_resp
             }))
 
     elif action == "APPLY_CNC_SETTINGS":

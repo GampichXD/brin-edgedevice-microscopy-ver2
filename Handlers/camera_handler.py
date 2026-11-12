@@ -4,9 +4,12 @@ import json
 import base64
 import shutil
 import asyncio
+import subprocess
+import time
 import cv2
 from datetime import datetime
 from Hardware.Devices.camera import camera_core
+from Hardware.Utils import edge_state, flatfield, test_logger
 
 LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp_images"))
 if not os.path.exists(LOCAL_TMP_DIR):
@@ -15,6 +18,77 @@ if not os.path.exists(LOCAL_TMP_DIR):
 
 def _safe_session(s):
     return re.sub(r"[^A-Za-z0-9_-]", "", str(s))[:40] or "adhoc"
+
+
+_finalize_tasks = set()  # pegang referensi agar task tidak di-GC
+TRANSCODE_TIMEOUT_S = 3600
+
+
+def _transcode_to_h264(src, dst):
+    """MJPG AVI -> H.264 MP4 dengan moov di depan, supaya bisa diputar dan di-seek di browser.
+    Orin Nano tidak punya encoder H.264 hardware, jadi memakai x264 dengan preset tercepat.
+    Output selalu I420 baseline, karena selain itu Chrome menolak memutarnya."""
+    pipeline = [
+        "nice", "-n", "10", "gst-launch-1.0", "-q",
+        "filesrc", f"location={src}", "!", "avidemux", "!", "jpegdec", "!", "videoconvert", "!",
+        "video/x-raw,format=I420", "!",
+        "x264enc", "speed-preset=ultrafast", "bframes=0", "threads=2", "!",
+        "video/x-h264,profile=baseline", "!", "h264parse", "!",
+        "mp4mux", "faststart=true", "!", "filesink", f"location={dst}",
+    ]
+    done = subprocess.run(pipeline, capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_S)
+    if done.returncode != 0:
+        raise RuntimeError((done.stderr or done.stdout).strip()[-300:])
+
+
+def _finalize_recording(temp_path, final_path):
+    """Hasil konversi baru muncul dengan nama final setelah utuh, supaya syncer tidak
+    mengunggah file setengah jadi. Kalau konversi gagal, rekaman mentah tetap disimpan."""
+    if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+        print(f"[BRIDGE ERROR] Rekaman kosong atau tidak ada: {temp_path}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return False
+    partial = os.path.join(os.path.dirname(final_path), "_temp_" + os.path.basename(final_path))
+    try:
+        _transcode_to_h264(temp_path, partial)
+        if os.path.getsize(partial) == 0:
+            raise RuntimeError("hasil konversi kosong")
+        os.replace(partial, final_path)
+        os.remove(temp_path)
+        print(f"[BRIDGE] SUKSES! Video H.264 disimpan: {final_path}")
+        return True
+    except Exception as e:
+        print(f"[BRIDGE ERROR] Konversi video gagal, rekaman mentah tetap di {temp_path}: {e}")
+        if os.path.exists(partial):
+            os.remove(partial)
+        return False
+
+
+def _apply_flatfield(path):
+    reference = flatfield.load_reference()
+    img = cv2.imread(path)
+    if reference is None or img is None or reference[0].shape != img.shape:
+        print("[BRIDGE CAMERA WARNING] Flat-field dilewati: referensi belum ada atau ukurannya berbeda.")
+        return
+    cv2.imwrite(path, flatfield.correct(img, *reference), [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+
+def _encode_preview(src_path):
+    """JPEG preview lebar maks 900 px; kalau gagal, kirim berkas aslinya."""
+    try:
+        img = cv2.imread(src_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            if w > 900:
+                img = cv2.resize(img, (900, max(1, int(h * 900 / w))))
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                return buf.tobytes()
+    except Exception:
+        pass
+    with open(src_path, "rb") as f:
+        return f.read()
 
 async def handle_camera_action(action: str, data: dict, websocket, ws_lock, state: dict):
     """Router untuk instruksi dan konfigurasi Kamera"""
@@ -33,6 +107,11 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
     elif action == "START_STREAM":
         print("[BRIDGE] Perintah VPS: Aktifkan Live Stream.")
         state["is_streaming"] = True
+        # Kamera gagal dibuka atau pipeline mati: coba lagi tanpa perlu restart main.py.
+        # Saat stitching kamera sengaja ditutup untuk menghemat memori.
+        if not camera_core.is_alive() and not edge_state.stitching:
+            print("[BRIDGE] Kamera tidak aktif, mencoba membuka ulang...")
+            await asyncio.to_thread(camera_core.reopen)
 
     elif action == "STOP_STREAM":
         print("[BRIDGE] Perintah VPS: Matikan Live Stream.")
@@ -46,7 +125,7 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         if not state["is_recording"]:
             state["is_recording"] = True
             state["is_streaming"] = True  # Pastikan stream aktif agar frame mengalir ke VideoWriter
-            folder_id = data.get("folder_id", "unsorted")
+            folder_id = _safe_session(data.get("folder_id") or "unsorted")
             # ABSOLUT relatif ke Hardware/local_datasets (bukan CWD) — sama dengan
             # yang dipantau vps_syncer.py, jadi video pasti ke-sync ke VPS.
             rec_dir = os.path.abspath(os.path.join(
@@ -55,7 +134,8 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
             # .mp4 (mp4v) — codec paling kompatibel di OpenCV Jetson & browser.
             filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
             state["recording_final_filepath"] = os.path.join(rec_dir, filename)
-            state["recording_filepath"] = os.path.join(rec_dir, f"_temp_{filename}")
+            # Direkam dulu sebagai MJPG, lalu dikonversi ke H.264 saat berhenti (lihat _finalize_recording).
+            state["recording_filepath"] = os.path.join(rec_dir, f"_temp_{os.path.splitext(filename)[0]}.avi")
             state["recording_pending_init"] = True
             print(f"[BRIDGE] Mulai merekam video ke {state['recording_filepath']}")
 
@@ -67,17 +147,11 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
                 state["video_writer"].release()
                 print(f"[BRIDGE] VideoWriter dirilis. File sementara: {state['recording_filepath']}")
                 state["video_writer"] = None
-                if os.path.exists(state["recording_filepath"]):
-                    file_size = os.path.getsize(state["recording_filepath"])
-                    print(f"[BRIDGE] Ukuran file sementara: {file_size} bytes")
-                    if file_size > 0:
-                        os.rename(state["recording_filepath"], state["recording_final_filepath"])
-                        print(f"[BRIDGE] SUKSES! File final disimpan: {state['recording_final_filepath']}")
-                    else:
-                        os.remove(state["recording_filepath"])
-                        print(f"[BRIDGE ERROR] File sementara 0-byte, dihapus. Recording gagal!")
-                else:
-                    print(f"[BRIDGE ERROR] File sementara tidak ditemukan: {state['recording_filepath']}")
+                # Di latar belakang: video panjang butuh waktu, dan perintah motor tidak boleh tertahan.
+                task = asyncio.create_task(asyncio.to_thread(
+                    _finalize_recording, state["recording_filepath"], state["recording_final_filepath"]))
+                _finalize_tasks.add(task)
+                task.add_done_callback(_finalize_tasks.discard)
             else:
                 print(f"[BRIDGE ERROR] STOP_RECORDING dipanggil tapi video_writer=None. Tidak ada frame yang direkam!")
             print("[BRIDGE] Perekaman video dihentikan.")
@@ -102,26 +176,20 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
             save_dir = LOCAL_TMP_DIR
             local_name = requested_filename  # boleh None -> camera_core buat nama sendiri
 
-        saved = camera_core.save_snapshot(save_dir, prefix=prefix, coord_x=cx, coord_y=cy,
-                                          requested_filename=local_name)
+        # Disk I/O dan encode di thread pool: event loop harus tetap bebas supaya
+        # watchdog koneksi tidak salah membaca loop yang macet sebagai link putus.
+        t_capture_ns = time.time_ns()
+        saved = await asyncio.to_thread(
+            camera_core.save_snapshot, save_dir, prefix=prefix, coord_x=cx, coord_y=cy,
+            requested_filename=local_name)
         if saved:
             local_path = os.path.join(save_dir, saved)
             print(f"[BRIDGE CAMERA] Tersimpan: {local_path}")
         else:
-            print("[BRIDGE CAMERA WARNING] Kamera fisik offline. Membangkitkan gambar mockup...")
-            import numpy as np
-            import random
-            saved = local_name or (
-                f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                f"_X{str(cx).replace('.','_')}_Y{str(cy).replace('.','_')}.jpg"
-            )
-            os.makedirs(save_dir, exist_ok=True)
-            local_path = os.path.join(save_dir, saved)
-            mock_img = np.zeros((480, 640, 3), dtype=np.uint8)
-            mock_img[:] = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
-            cv2.putText(mock_img, f"MOCK {saved}", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-            cv2.imwrite(local_path, mock_img)
-            print(f"[BRIDGE CAMERA] MOCK Tersimpan: {local_path}")
+            # Tidak ada gambar pengganti: VPS membalas 504 untuk retake, dan tile grid
+            # dibiarkan kosong supaya bisa di-Retake.
+            print("[BRIDGE CAMERA WARNING] Kamera fisik offline. Citra tidak diambil.")
+            return
 
         # Nama yang DILAPORKAN ke VPS (kontrak static/uploads + capturedImages di
         # frontend). Grid -> nama dari backend 'IMG_<session>_r_c.jpg' (unik lintas
@@ -130,28 +198,20 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         if is_grid:
             print(f"[BRIDGE CAMERA] Sesi: {local_path} (dilaporkan sbg {report_name})")
 
+        if flatfield.enabled():
+            await asyncio.to_thread(_apply_flatfield, local_path)
+
         # UPLOAD KE VPS SUPAYA BISA DILIHAT DI BROWSER.
         # Kirim versi PREVIEW yang dikecilkan (bukan full-res) supaya paket
         # WebSocket kecil -> tidak menyumbat stream/telemetri saat grid besar
         # (mis. 5x5+). Full-res tetap ada di folder sesi untuk stitching.
         try:
-            src_path = local_path
-            frame_bytes = None
-            try:
-                img = cv2.imread(src_path)
-                if img is not None:
-                    h, w = img.shape[:2]
-                    if w > 900:
-                        img = cv2.resize(img, (900, max(1, int(h * 900 / w))))
-                    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    if ok:
-                        frame_bytes = buf.tobytes()
-            except Exception:
-                frame_bytes = None
-            if frame_bytes is None:
-                with open(src_path, "rb") as f:
-                    frame_bytes = f.read()
+            frame_bytes = await asyncio.to_thread(_encode_preview, local_path)
             encoded_image = base64.b64encode(frame_bytes).decode('utf-8')
+            if is_grid:
+                test_logger.log("tiles", session=session, tile_id=report_name, grid_x=gx, grid_y=gy,
+                                t_cmd_rx_ns=data.get("_t_rx_ns", ""), t_capture_ns=t_capture_ns,
+                                bytes=os.path.getsize(local_path))
             async with ws_lock:
                 await websocket.send(json.dumps({
                     "event": "IMAGE_CAPTURED",
@@ -160,6 +220,14 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
                 }))
         except Exception as e:
             print(f"[BRIDGE ERROR] Gagal mengirim base64 image ke websocket: {e}")
+
+    elif action == "CALIBRATE_FLATFIELD":
+        mode = data.get("mode")
+        try:
+            path = await asyncio.to_thread(flatfield.capture_reference, camera_core.capture_frame, mode)
+            print(f"[BRIDGE CAMERA] Referensi flat-field '{mode}' tersimpan: {path}")
+        except Exception as e:
+            print(f"[BRIDGE CAMERA ERROR] Kalibrasi flat-field gagal: {e}")
 
     elif action == "PURGE_CACHE":
         print("[BRIDGE] 🧹 Menerima perintah PURGE_CACHE dari VPS.")
@@ -179,6 +247,16 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
                     pass
             print(f"[BRIDGE] ✅ Purge selesai. {cleared} item dihapus dari {LOCAL_TMP_DIR}.")
             
+    elif action == "PURGE_SESSION":
+        # Hanya berkas kerja satu sesi scan. Dataset yang sudah disimpan tidak tersentuh.
+        session = _safe_session(data.get("session") or "")
+        if data.get("session"):
+            for name in (session, f"_stage_{session}", f"_stage_scaled_{session}"):
+                target = os.path.join(LOCAL_TMP_DIR, name)
+                if os.path.isdir(target):
+                    shutil.rmtree(target, ignore_errors=True)
+                    print(f"[BRIDGE] 🧹 PURGE_SESSION: {target} dihapus.")
+
     elif action == "PURGE_DATASET_FOLDER":
         # VPS menghapus 1 folder dataset -> hapus salinan lokal di local_datasets/<id>
         folder_id = _safe_session(data.get("folder_id", ""))
@@ -201,22 +279,28 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
         if folder_id and os.path.isdir(target_dir):
             existing = set(os.listdir(target_dir))
             for fn in filenames:
-                base = os.path.basename(str(fn))
-                # cocokkan nama persis ATAU prefix (vps sering menambah _timestamp)
+                base = os.path.basename(str(fn or ""))
+                if not base:
+                    continue
+                # Nama persis, atau varian bertimestamp dari /add-images di VPS
+                # (<stem>_YYYYmmdd_HHMMSS<ext>). tile.jpg TIDAK boleh ikut menghapus
+                # tile_r0_c0.jpg. Marker .synced ikut dihapus bersama berkasnya.
                 stem, ext = os.path.splitext(base)
-                for cand in list(existing):
-                    if cand == base or cand.startswith(stem + "_") or cand == stem + ext:
+                stamped = re.compile(rf"{re.escape(stem)}_\d{{8}}_\d{{6}}{re.escape(ext)}")
+                for cand in sorted(existing):
+                    target = cand[:-len(".synced")] if cand.endswith(".synced") else cand
+                    if target == base or stamped.fullmatch(target):
                         try:
                             os.remove(os.path.join(target_dir, cand))
                             existing.discard(cand)
                             removed += 1
+                            print(f"[BRIDGE] 🧹 PURGE_DATASET_FILES: {cand} dihapus.")
                         except Exception:
                             pass
         print(f"[BRIDGE] 🧹 PURGE_DATASET_FILES: {removed} file dihapus dari {target_dir}.")
 
     elif action == "PURGE_ALL_DATASETS":
         print("[BRIDGE] 🚨 Menerima perintah PURGE_ALL_DATASETS dari VPS!")
-        import shutil
         # Hapus LOCAL_TMP_DIR isinya
         if os.path.exists(LOCAL_TMP_DIR):
             shutil.rmtree(LOCAL_TMP_DIR, ignore_errors=True)

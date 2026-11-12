@@ -6,7 +6,11 @@ import time
 import subprocess
 import struct
 import atexit
+import re
 from datetime import datetime
+
+FRAME_STALE_NS = 5_000_000_000  # frame lebih tua dari ini berarti pipeline kamera sudah mati
+SAFE_CAPTURE_NAME = re.compile(r"[A-Za-z0-9._-]+\.(jpg|jpeg|png)")
 
 class IMX477CameraCore:
     def __init__(self, sensor_id=0, width=1280, height=720, fps=30):
@@ -21,6 +25,7 @@ class IMX477CameraCore:
 
         # Threading untuk live streaming anti-blocking
         self.jpeg_frame = None   # Menyimpan JPEG bytes mentah (sudah terkompresi)
+        self.last_frame_time_ns = None  # epoch ns saat jpeg_frame terakhir diambil dari kamera
         self.started = False
         self.read_lock = threading.Lock()
         self.thread = None
@@ -61,6 +66,7 @@ class IMX477CameraCore:
                     if first_frame is not None:
                         with self.read_lock:
                             self.jpeg_frame = first_frame
+                            self.last_frame_time_ns = time.time_ns()
                         self.started = True
                         self.thread = threading.Thread(target=self._update_loop_gst, daemon=True)
                         self.thread.start()
@@ -232,6 +238,7 @@ class IMX477CameraCore:
                 if frame is not None:
                     with self.read_lock:
                         self.jpeg_frame = frame
+                        self.last_frame_time_ns = time.time_ns()
                 else:
                     # GStreamer mungkin putus
                     if self.proc and self.proc.poll() is not None:
@@ -253,6 +260,7 @@ class IMX477CameraCore:
                 if ret:
                     with self.read_lock:
                         self.jpeg_frame = buf.tobytes()
+                        self.last_frame_time_ns = time.time_ns()
             else:
                 time.sleep(0.02)
             time.sleep(1.0 / self.fps)
@@ -278,6 +286,16 @@ class IMX477CameraCore:
         except Exception as e:
             print(f"[CORE CAMERA] Decode error: {e}")
             return None
+
+    def is_alive(self) -> bool:
+        """True kalau kamera benar-benar masih menghasilkan frame baru."""
+        if not self.started or self.last_frame_time_ns is None:
+            return False
+        return time.time_ns() - self.last_frame_time_ns < FRAME_STALE_NS
+
+    def reopen(self) -> bool:
+        self.close()
+        return bool(self.open())
 
     def capture_jpeg_bytes(self):
         """Mengambil JPEG bytes langsung (tanpa perlu decode ke numpy).
@@ -329,11 +347,18 @@ class IMX477CameraCore:
         jpeg_bytes = self.capture_jpeg_bytes()
         if jpeg_bytes is None:
             return None
+        # Frame basi dari pipeline yang sudah mati tidak boleh tersimpan sebagai citra baru.
+        if self.last_frame_time_ns is not None and time.time_ns() - self.last_frame_time_ns >= FRAME_STALE_NS:
+            print("[CORE CAMERA ERROR] Frame terakhir sudah basi, citra tidak diambil.")
+            return None
 
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        if requested_filename:
+        # Nama dari luar disaring: tidak boleh menulis di luar output_dir. Kalau tidak
+        # cocok, pakai nama otomatis (VPS menangani tile yang tak kunjung tiba).
+        requested_filename = os.path.basename(str(requested_filename)) if requested_filename else None
+        if requested_filename and SAFE_CAPTURE_NAME.fullmatch(requested_filename):
             filename = requested_filename
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
