@@ -1,0 +1,5 @@
+script,trial,ok,retries,wall_time_s,total_time_s,peak_ram_mb,peak_gpu_mb,error
+SIFT_BFM,1,False,0,18.381,,,,exit code 1
+SIFT_LG,1,False,0,7.75,,,,exit code 1
+SP_LG,1,False,0,16.494,,,,exit code 1
+BRUTE_FORCE,1,False,0,1.208,,,,exit code 1

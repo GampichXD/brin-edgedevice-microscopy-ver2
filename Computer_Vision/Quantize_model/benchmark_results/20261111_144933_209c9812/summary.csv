@@ -1,0 +1,13 @@
+script,metric,unit,trials,failed,n,mean,std,min,max,median
+SIFT_BFM,total_time,s,1,1,,,,,,
+SIFT_BFM,peak_ram,MB,1,1,,,,,,
+SIFT_BFM,peak_gpu,MB,1,1,,,,,,
+SIFT_LG,total_time,s,1,1,,,,,,
+SIFT_LG,peak_ram,MB,1,1,,,,,,
+SIFT_LG,peak_gpu,MB,1,1,,,,,,
+SP_LG,total_time,s,1,1,,,,,,
+SP_LG,peak_ram,MB,1,1,,,,,,
+SP_LG,peak_gpu,MB,1,1,,,,,,
+BRUTE_FORCE,total_time,s,1,1,,,,,,
+BRUTE_FORCE,peak_ram,MB,1,1,,,,,,
+BRUTE_FORCE,peak_gpu,MB,1,1,,,,,,

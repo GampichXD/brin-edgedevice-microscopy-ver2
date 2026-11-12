@@ -1,0 +1,63 @@
+##############################################################################
+# SIFT_BFM  trial 1/1  (FAILED, wall 18.38s)
+##############################################################################
+
+Traceback (most recent call last):
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/SIFT_BFM.py", line 1473, in <module>
+    image_data, grid_info = load_image(folder_path, CONFIG['resize_factor'])
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/SIFT_BFM.py", line 232, in load_image
+    raise FileNotFoundError(f"Folder '{folder_path}' tidak ditemukan")
+FileNotFoundError: Folder 'local_datasets/209c9812' tidak ditemukan
+
+
+##############################################################################
+# SIFT_LG  trial 1/1  (FAILED, wall 7.75s)
+##############################################################################
+[INFO] LightGlue (SIFT) loaded from: /home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/Weights/sift_lightglue.pth
+[INFO] Device: cuda
+
+/home/brin-microscope/venvs/compvis/lib/python3.10/site-packages/torch/cuda/__init__.py:59: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[0;93m2026-11-11 14:49:55.594312803 [W:onnxruntime:Default, device_discovery.cc:211 DiscoverDevicesForPlatform] GPU device discovery failed: device_discovery.cc:91 ReadFileContents Failed to open file: "/sys/class/drm/card1/device/vendor"[m
+Traceback (most recent call last):
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/SIFT_LG.py", line 1804, in <module>
+    image_data, grid_info = load_image(folder_path, CONFIG['resize_factor'])
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/SIFT_LG.py", line 311, in load_image
+    raise FileNotFoundError(f"Folder '{folder_path}' tidak ditemukan")
+FileNotFoundError: Folder 'local_datasets/209c9812' tidak ditemukan
+
+
+##############################################################################
+# SP_LG  trial 1/1  (FAILED, wall 16.49s)
+##############################################################################
+[11/11/2026-14:50:12] [TRT] [W] Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+[11/11/2026-14:50:12] [TRT] [W] Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+[INFO] SuperPoint TensorRT engine loaded: superpoint_fp16.engine
+[INFO] LightGlue TensorRT engine loaded: superpoint_lightglue_fp16.engine
+[INFO] TensorRT precision: SuperPoint=fp16  LightGlue=fp16
+
+/home/brin-microscope/venvs/compvis/lib/python3.10/site-packages/torch/cuda/__init__.py:59: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[0;93m2026-11-11 14:50:02.351960596 [W:onnxruntime:Default, device_discovery.cc:211 DiscoverDevicesForPlatform] GPU device discovery failed: device_discovery.cc:91 ReadFileContents Failed to open file: "/sys/class/drm/card1/device/vendor"[m
+Traceback (most recent call last):
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/SP_LG.py", line 2445, in <module>
+    run_pipeline(CONFIG, folder_path)
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/SP_LG.py", line 2300, in run_pipeline
+    image_data, grid_info = load_image(folder_path, cfg['resize_factor'])
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/SP_LG.py", line 616, in load_image
+    raise FileNotFoundError(f"Folder '{folder_path}' tidak ditemukan")
+FileNotFoundError: Folder 'local_datasets/209c9812' tidak ditemukan
+
+
+##############################################################################
+# BRUTE_FORCE  trial 1/1  (FAILED, wall 1.21s)
+##############################################################################
+
+Traceback (most recent call last):
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/brute_force.py", line 1465, in <module>
+    image_data, grid_info = load_image(folder_path, CONFIG['resize_factor'])
+  File "/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Quantize_model/brute_force.py", line 317, in load_image
+    raise FileNotFoundError(f"Folder '{folder_path}' tidak ditemukan")
+FileNotFoundError: Folder 'local_datasets/209c9812' tidak ditemukan
+
+

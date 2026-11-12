@@ -2796,7 +2796,7 @@ def extract_roi(image, roi_info, padding=5):
 if __name__ == '__main__':
     import argparse
     _parser = argparse.ArgumentParser(description="Brute-force subtraction tile stitching")
-    _parser.add_argument('--path', default="c:/path/to/your/tiles",
+    _parser.add_argument('--path', default="/home/brin-microscope/Documents/Tugas-Akhir/Hardware/local_datasets/bfe9a132",
                          help="Folder of tile images to stitch")
     folder_path = _parser.parse_args().path
 

@@ -1,0 +1,2 @@
+script,trial,ok,retries,wall_time_s,total_time_s,peak_ram_mb,peak_gpu_mb,error
+BRUTE_FORCE,1,False,0,20.262,,,,timed out after 20s

@@ -662,6 +662,7 @@ class TRTEngine:
 
     def infer(self, inputs):
         """inputs: {name: contiguous torch.cuda.Tensor}. Returns {name: torch.cuda.Tensor}
+<<<<<<< Updated upstream
         sliced/reshaped to the actual output shape for this call.
 
         Everything CUDA-related here runs inside `with torch.cuda.stream(self.stream)`
@@ -691,6 +692,27 @@ class TRTEngine:
                 allocators[name] = alloc
 
             ok = self.context.execute_async_v3(self.stream.cuda_stream)
+=======
+        sliced/reshaped to the actual output shape for this call."""
+        for name, tensor in inputs.items():
+            # set_input_shape returns False (and only logs) when the shape is
+            # outside the engine's optimization profile; executing anyway
+            # corrupts the CUDA context ("illegal memory access"), so fail loudly.
+            if not self.context.set_input_shape(name, tuple(tensor.shape)):
+                raise RuntimeError(
+                    f"TensorRT rejected input shape {tuple(tensor.shape)} for '{name}' "
+                    f"(outside the engine's optimization profile)")
+            self.context.set_tensor_address(name, tensor.data_ptr())
+
+        allocators = {}
+        for name in self.output_names:
+            torch_dtype = self._DTYPE_TRT_TO_TORCH[self.engine.get_tensor_dtype(name)]
+            alloc = _TRTOutputAllocator(torch_dtype)
+            self.context.set_output_allocator(name, alloc)
+            allocators[name] = alloc
+
+        ok = self.context.execute_async_v3(self.stream.cuda_stream)
+>>>>>>> Stashed changes
         self.stream.synchronize()
         if not ok:
             raise RuntimeError("TensorRT execute_async_v3 failed")
@@ -1699,21 +1721,48 @@ def _extract_region_onnx(roi, sp_sess, resize_size=1024):
     return kps, descs.astype(np.float32), scs.astype(np.float32)
 
 
+# Lower bound of the SuperPoint TensorRT engine's optimization profile
+# (see TensorRT/superpoint_*.log: profile 0 = [1,1,256,256]..[1,1,1024,1024]).
+TRT_SP_MIN_SIDE = 256
+
+
 def _extract_region_tensorrt(roi, sp_engine, resize_size=1024):
     """SuperPoint via the raw TensorRT engine. Same resize/rescale-back and
     padding-filter as _extract_region_onnx -- the two exported graphs are
     architecturally identical, only the runtime differs."""
     t = torch.from_numpy(roi).float().unsqueeze(0).unsqueeze(0).cuda() / 255.0  # (1,1,H,W)
+<<<<<<< Updated upstream
     t, scale = _resize_pad_for_superpoint(
         t, resize_size, CONFIG.get('trt_sp_shape_min', (256, 256)))
+=======
+    t = kornia_resize(t, resize_size, side='long', antialias=True, align_corners=None).contiguous()
+    hr, wr = t.shape[-2], t.shape[-1]
+    scale = np.array([wr / w0, hr / h0], dtype=np.float32)  # (sx, sy)
+
+    # The SuperPoint engine's optimization profile only accepts H, W in
+    # [TRT_SP_MIN_SIDE, resize_size]. Thin overlap strips (e.g. 171x1024 at a
+    # ~17% overlap) fall below the minimum, so replicate-pad the short side up
+    # to it and discard any keypoints that land in (or right at the edge of)
+    # the padding. Replicate (not zero) padding avoids a fake strong edge.
+    pad_b = max(0, TRT_SP_MIN_SIDE - hr)
+    pad_r = max(0, TRT_SP_MIN_SIDE - wr)
+    if pad_b or pad_r:
+        t = torch.nn.functional.pad(t, (0, pad_r, 0, pad_b), mode='replicate').contiguous()
+>>>>>>> Stashed changes
 
     out = sp_engine.infer({'image': t})
     kps   = out['keypoints'][0].float().cpu().numpy()
     scs   = out['scores'][0].cpu().numpy()
     descs = out['descriptors'][0].cpu().numpy()
 
-    # Same top_k_keypoints padding as the onnx backend -- drop score<=0 dummies.
+    # Same top_k_keypoints padding as the onnx backend -- drop score<=0 dummies,
+    # plus anything outside the real (unpadded) image area.
+    border = 4  # SuperPoint's own remove_borders width
     real = scs > 0
+    if pad_b:
+        real &= kps[:, 1] < hr - border
+    if pad_r:
+        real &= kps[:, 0] < wr - border
     kps, scs, descs = kps[real], scs[real], descs[real]
     if len(kps) == 0:
         return None

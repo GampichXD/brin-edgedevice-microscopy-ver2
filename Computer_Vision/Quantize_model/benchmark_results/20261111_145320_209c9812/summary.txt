@@ -1,0 +1,22 @@
+interpreter: /home/brin-microscope/venvs/compvis/bin/python
+dataset    : /home/brin-microscope/Documents/Tugas-Akhir/Hardware/local_datasets/209c9812
+
+======================================================================
+BRUTE_FORCE  (brute_force.py, 1 trials)
+======================================================================
+  Trial 1/1 ... FAILED  (timed out after 20s)
+
+======================================================================
+STATISTICAL SUMMARY (1 trials/script)
+======================================================================
+
+BRUTE_FORCE:
+  [WARN] 1/1 trial(s) failed -- stats below exclude them
+  No successful trials.
+
+======================================================================
+CROSS-SCRIPT COMPARISON
+======================================================================
+script       total (s)              peak RAM (MB)          peak GPU (MB)         
+---------------------------------------------------------------------------------
+BRUTE_FORCE  (no successful trials)

@@ -1,0 +1,7 @@
+interpreter: /home/brin-microscope/venvs/compvis/bin/python
+dataset    : /home/brin-microscope/Documents/Tugas-Akhir/Hardware/local_datasets/209c9812
+
+======================================================================
+SIFT_BFM  (SIFT_BFM.py, 1 trials)
+======================================================================
+  Trial 1/1 ... 
