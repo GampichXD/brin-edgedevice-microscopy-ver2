@@ -3,7 +3,11 @@ Tile Stitching Pipeline -- SIFT + BFMatcher Variant
 =====================================================
 Feature extraction             : SIFT  (OpenCV)
 Feature matching               : BFMatcher  (brute-force, Lowe's ratio test)
-Homography + RANSAC            : cv2.estimateAffinePartial2D (unchanged)
+Translation estimation         : 2-DOF median of match displacements, with a
+                                  stage-prior pre-filter and a nominal-shift
+                                  fallback for pairs that fail registration
+                                  entirely (see correction.txt) -- not RANSAC
+                                  affine, since this rig has no rotation/scale.
 Reprojection error             : calculate_reprojection_error (unchanged)
 NCC evaluation                 : calculate_overlap_ncc (unchanged)
 Overlap quality metrics        : PSNR, SSIM, RMSE, NCC (unchanged)
@@ -47,12 +51,6 @@ try:
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
-
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
 
 
 # ============================================================
@@ -157,19 +155,124 @@ MATCHER_ACCEL = "CPU"
 # ============================================================
 CONFIG = {
     # --- General ---
-    'resize_factor':        1.0,
-    'overlap_percentage':   0.3,
+    'resize_factor':        0.5,
+    'overlap_percentage':   0.4,
     'canvas_padding':       50,
+    'registration_channel': 'b',
+                                  # which single channel the shift search runs on
+                                  # (blending/output always stays full RGB):
+                                  #   'gray' -- 0.299R + 0.587G + 0.114B (luma)
+                                  #   'r' / 'g' / 'b' -- one raw colour channel
+                                  #   'auto' -- per tile, pick the channel with
+                                  #             the largest post-highpass detail
+                                  #    banding at tile pitch, which is why
+    # the solve is per channel.         (std of x - GaussianBlur(x))
+                                  # Use a raw channel when the tiles have a
+                                  # strong colour cast that buries the texture
+
+    # --- Dish / empty-tile masking ---
+    # A circular dish inside a rectangular grid leaves tiles outside it as
+    # pure background -- worse than useless for registration, since they are
+    # exactly the low-texture pairs that fail matching and fragment the
+    # transformation graph. Detect and drop them in load_image(), before
+    # calculate_overlap() ever forms a pair with them.
+    'skip_empty_tiles':    False,  # off by default: the threshold below needs
+                                   # calibrating per dataset/exposure before
+                                   # it's safe to trust (see empty_tile_min_std).
+    'empty_tile_min_std':  8.0,    # a tile is dropped if its high-pass std is
+                                   # <= this. Calibrate against one tile you
+                                   # KNOW is empty background before enabling
+                                   # skip_empty_tiles on a new dataset -- the
+                                   # floor depends on exposure/gain, not just
+                                   # content. [DISH-MASK] in the load_image
+                                   # log lists every tile it dropped.
+    'empty_tile_sigma':    12.0,   # Gaussian sigma (px) for the high-pass used
+                                   # by the empty-tile check (same technique as
+                                   # the 'highpass' registration preprocessing).
+
+    # --- Downsampled preview ---
+    # A full-resolution mosaic (hundreds of MP on a large grid) is not
+    # something anyone views at 100% anyway -- for a human sanity check or a
+    # thesis figure, a small preview costs almost nothing next to the full
+    # blend that already ran. Purely additive: writes one extra small file
+    # alongside the existing full-resolution result, changes nothing else.
+    'save_preview':   False,   # write a downsampled copy next to the full-res result
+    'preview_scale':  0.125,  # e.g. a 362 MP mosaic -> ~5.7 MP preview
+
+    # --- Lazy tile loading ---
+    # OFF by default -- this is a straight toggle, not a replacement: with it
+    # False, behaviour is byte-for-byte the same as before this option
+    # existed. Turn it on only when tile-RAM (image_data holding all N tiles)
+    # is the thing that doesn't fit, e.g. a large grid on a memory-limited
+    # device. Trades that RAM for re-decoding a tile from disk on every
+    # access instead of once -- worth it only when storage is fast (per
+    # correction.txt). See _LazyTile.
+    'lazy_tile_loading': False,
+
+    # --- Photometric correction (see STEP 0.5) ---
+    # Ported from brute_force.py after A/B testing on real captures
+    # (whole_petri_fr, 20x34) established this combination as the best
+    # result: flat-field alone left a measurable halo, +gain compensation
+    # reduced tile-pitch colour banding further (row-banding power roughly
+    # halved). Both default ON here -- unlike brute_force.py, where they
+    # default off to keep that file an A/B harness, this script has no
+    # "unmodified baseline" to stay comparable to.
+    'flatfield_correction': True,  # divide out smooth vignetting (median-stack
+                                   # per-pixel estimate across sampled tiles)
+    'flatfield_samples':    60,
+    'flatfield_sigma':      25.0,   # heavy blur -- keeps ONLY low frequencies.
+
+    # --- Per-tile gain compensation (STEP 5.6) ---
+    # Flat-field is ONE spatial profile shared by every tile, so it cannot
+    # fix a PER-TILE scalar (auto-exposure/auto-white-balance drift over a
+    # long scan). Measured on whole_petri_fr after flat-field: R/G ratio
+    # drifted 37.6% relative std across tiles vs 3.8% for luminance -- i.e.
+    # the residual halo reads as COLOUR banding at tile pitch, which is why
+    # the solve is per channel.
+    'gain_compensation':    True,
+    'gain_per_channel':     True,   # 3 independent solves. A single luminance
+                                    # gain leaves the dominant R/G term untouched.
+    'gain_reg_lambda':      0.3,    # pull every log-gain toward 0. NOT optional:
+                                    # unregularised the solve "explains" real
+                                    # scene differences as exposure and produced
+                                    # gains spanning 15x on whole_petri_fr, which
+                                    # wrecks the image. At 0.3 the fit is barely
+                                    # worse with gains held to a sane range.
+    'gain_max_logratio':    0.35,   # reject a pair whose two strips differ by
+                                    # more than this in log space (~1.42x) --
+                                    # that is content disagreement or
+                                    # misregistration, not exposure.
+    'gain_min_median':      15.0,   # skip a strip this dark; a ratio between two
+                                    # near-black strips is noise.
+
+    # --- Overlap-driven shading correction (STEP 5.7) ---
+    # Solves ONE shading field shared by all tiles from the tiles' own
+    # overlap disagreement -- see solve_overlap_shading()'s docstring for the
+    # model and why it is a no-op on tiles cut from a single source image
+    # (unlike flatfield_correction, which always applies something).
+    # Complementary to gain_compensation, not a replacement: this handles the
+    # WITHIN-tile spatial term, gain handles the per-tile scalar term.
+    'overlap_shading':       False,   # OFF by default like the other photometric toggles
+    'shading_grid':          (12, 20),# (rows, cols) control points. Shading is
+                                      # low-frequency, so coarse is correct --
+                                      # a fine grid just fits noise.
+    'shading_sample_step':   6,       # sample every Nth pixel of each overlap
+    'shading_smooth_lambda': 4.0,     # neighbouring control points should agree
+    'shading_zero_lambda':   0.05,    # pull log S toward 0. This is what makes
+                                      # "no evidence" produce "no correction",
+                                      # and makes the normal matrix PD.
+    'shading_max_logratio':  0.35,    # reject a pixel pair differing by >~1.42x
+                                      # -- content mismatch / misregistration
+    'shading_min_value':     12.0,    # skip near-black pixels; their ratio is noise
+    'shading_max_logamp':    0.5,     # hard clamp on the solved field (~1.65x)
+    'x_axis_descending':    True,  # see load_image()'s comment on unique_x --
+                                    # flip to False for grid-index filenames
+                                    # (tile_r_c / embedded _r_c_) if horizontal
+                                    # registration fails near-totally while
+                                    # vertical partially works.
     'display_feather_distance':  30,  # soft feather for human viewing
-    'analysis_feather_distance': 0,   # hard seam for analysis/training copy
+    'analysis_feather_distance': 0,   # hard seam for anaw-gainlysis/training copy
     'feather_distance':     30,       # legacy alias -- used by blend_panorama
-    'save_analysis_copy':   False,     # also save a hard-seam copy alongside the soft display one
-    # 'cuda' moves blend_panorama's per-tile blend arithmetic (masking, feather-weight
-    # computation, canvas accumulation) onto the GPU via PyTorch tensors -- this is the
-    # O(canvas_size x 3 channels x num_tiles) part that gets slow on grids beyond ~5x5.
-    # The geometric warp + mask erode/distanceTransform stay on CPU via OpenCV either way
-    # (this build's OpenCV has no CUDA support to swap those to). Set to 'cpu' to disable.
-    'feather_blend_device': 'cpu' if HAS_TORCH and torch.cuda.is_available() else 'cpu',
     'normalization_method': 'skimage_histogram_match',
     'min_overlap_area':     500,
 
@@ -182,21 +285,71 @@ CONFIG = {
     # --- BFMatcher ---
     'lowe_ratio': 0.75,
 
-    # --- RANSAC / homography ---
-    'reproj_thresh':    4.0,   # px -- unified to 4.0 across all pipeline variants
-    'min_inlier_ratio': 0.3,   # informational -- not used to reject pairs
-    'affine_scale_bounds': (0.5, 2.0),  # reject a pair's affine transform if its
-        # uniform scale falls outside this. Adjacent tiles come from the same
-        # fixed lens, so scale should sit near 1.0 -- RANSAC can still return a
-        # locally-consistent-looking but globally wrong transform on repetitive
-        # colony textures, and an unchecked scale gets multiplied across the BFS
-        # transform chain in calculate_all_transforms(), which is what blew
-        # calculate_optimal_canvas() up to a multi-terabyte allocation.
+    # --- Translation estimation (see calculate_homography below) ---
+    # This rig only translates the stage in X/Y -- no rotation or scale --
+    # so registration is a 2-DOF median-of-displacements estimate, not a
+    # 4-DOF RANSAC affine fit. See correction.txt: RANSAC's minimal sample
+    # for a 4-DOF model is 2 points, so a "successful" 2-inlier fit is
+    # unverified noise, not a real estimate.
+    'reproj_thresh':    4.0,   # px -- inlier tolerance around the median displacement
+    'min_inlier_ratio': 0.15,   # now enforced: pairs below this ratio are rejected
+    'min_inlier_count': 10,    # absolute floor -- a ratio is meaningless when the
+                                # denominator is ~13; catches the 2-inlier/15 case.
+    'stage_prior_window': 50.0,  # px: matches whose displacement is farther than
+                                # this from the geometrically-expected shift (derived
+                                # from the pair's own overlap region) are excluded from
+                                # the median seed -- discards matches that are
+                                # geometrically impossible before they can bias the
+                                # estimate, which Lowe's ratio test alone won't catch
+                                # on repetitive/self-similar microscopy texture.
+    'use_nominal_fallback': True,  # if a geometrically-expected adjacent pair fails
+                                # registration entirely, substitute a nominal shift
+                                # derived from its overlap-region geometry instead of
+                                # dropping the edge -- keeps the transformation graph
+                                # connected instead of fragmenting into a handful of
+                                # reachable tiles.
+
+    # --- Canvas safety ---
+    'max_canvas_megapixels': 100,  # calculate_optimal_canvas() raises instead of
+                                    # allocating past this -- a real N-tile grid never
+                                    # gets close; hitting it means a bad accumulated
+                                    # transform, not a genuinely huge mosaic.
+
+    # --- Global tile-position adjustment (see solve_global_translations below) ---
+    'use_global_adjustment': True,  # position every tile with ONE least-squares
+                                    # solve over all pairwise translation
+                                    # constraints instead of chaining transforms
+                                    # along a BFS path from the reference tile.
+                                    # Chaining accumulates per-pair error with
+                                    # distance from the reference (staircase
+                                    # drift at the mosaic corners on large
+                                    # grids); the global solve spreads it
+                                    # evenly. False -> old calculate_all_transforms.
+    'grid_adjust_outlier_tol': 'adaptive', # before the solve, drop any pair whose
+                                    # translation deviates from its row/column
+                                    # median by more than this (fixed XY stage
+                                    # => all horizontal pairs share a dx, all
+                                    # vertical pairs a dy). Guards the L2 solve
+                                    # against a bad pair smearing error grid-wide.
+                                    # 'adaptive' -> derive the tolerance from the
+                                    # measured per-direction spread itself (MAD)
+                                    # instead of a fixed guess -- a fixed px value
+                                    # increasingly mis-rejects as grid extent (and
+                                    # the true spread) changes with grid size (see
+                                    # correction.txt). A number pins it; None skips
+                                    # the pre-filter entirely.
+    'nominal_fallback_weight': 0.1, # weight (vs. 1.0 for a measured edge) given to
+                                    # nominal-fallback edges (see
+                                    # add_nominal_fallback_edges) in the
+                                    # least-squares solve -- keeps the graph
+                                    # connected without letting an assumed shift
+                                    # pull real tiles' positions as hard as an
+                                    # actual measurement would.
 
     # --- Device ---
-    'use_gpu': True,                # Enable CUDA BFMatcher acceleration if available
+    'use_gpu': False,                # Enable CUDA BFMatcher acceleration if available
     'debug': False,                 # Gate visualization plotting to avoid headless display hangs
-    'evaluate_metrics': False,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
+    'evaluate_metrics': True,       # Gate skimage PSNR/SSIM/NCC CPU metrics calculation
     'enable_benchmark': True,       # Toggle Performance & Memory Tracker benchmarking
     'verbose_pair_metrics': False,  # Print PSNR/SSIM/NCC/RepError per pair (off = final summary only)
 }
@@ -206,7 +359,562 @@ CONFIG = {
 # STEP 1 : Image Loading & Coordinate Extraction
 # ============================================================
 
-def load_image(folder_path, resize_factor=1.0):
+def _tile_is_empty(gray, min_std=8.0, sigma=12.0):
+    """
+    True if *gray* looks like featureless background (e.g. outside a
+    circular dish on a large grid) rather than real tissue/colony content.
+
+    Same signal as the registration preprocessing's 'highpass' step: subtract
+    a heavily blurred copy and look at what's left. A tile with real content
+    has texture at this scale; empty background is flat, so its high-pass std
+    stays near the sensor noise floor. CALIBRATE min_std against one tile you
+    know is empty before relying on this on a new dataset -- the floor
+    depends on exposure/gain, not just content. Empty tiles are worse than
+    useless for registration: they are exactly the low-texture pairs that
+    fail matching and fragment the transformation graph, so drop them before
+    calculate_overlap() ever sees them (see CONFIG['skip_empty_tiles']).
+    """
+    hp = gray.astype(np.float32) - cv2.GaussianBlur(gray.astype(np.float32), (0, 0), sigma)
+    return float(hp.std()) <= min_std
+
+
+def _registration_gray(img_rgb, channel):
+    """
+    Single-channel uint8 image the shift search runs on. The colour image in
+    'image' is untouched -- blending and all output stay full RGB.
+
+    'gray' is luma (0.299R + 0.587G + 0.114B); 'r'/'g'/'b' take one raw
+    channel; 'auto' keeps whichever channel carries the most high-frequency
+    detail (std of x - GaussianBlur(x)) -- useful when a strong colour cast
+    buries the texture in luma, as in the blue-cast 10x10_1 tiles.
+    """
+    channel = (channel or 'gray').lower()
+    if channel == 'gray':
+        return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    idx = {'r': 0, 'g': 1, 'b': 2}
+    if channel in idx:
+        return np.ascontiguousarray(img_rgb[:, :, idx[channel]])
+    if channel == 'auto':
+        best_ch, best_detail = None, -1.0
+        for c in range(3):
+            x = img_rgb[:, :, c].astype(np.float32)
+            detail = float((x - cv2.GaussianBlur(x, (0, 0), sigmaX=3, sigmaY=3)).std())
+            if detail > best_detail:
+                best_ch, best_detail = c, detail
+        return np.ascontiguousarray(img_rgb[:, :, best_ch])
+    raise ValueError(f"Unknown registration_channel: '{channel}'")
+
+
+# ============================================================
+# STEP 0.5 : Photometric correction  (flat-field)
+# ============================================================
+# Smooth VIGNETTING -- a low-frequency radial/gradient falloff -- measured
+# on whole_petri_fr. Clearly visible on background tiles (e.g. r0_c0,
+# outside the dish: a clean gradient, no texture). Correct by dividing
+# out a HEAVILY blurred (sigma ~51) per-pixel median across many tiles:
+# real content varies tile to tile and washes out of the median, the
+# illumination profile does not.
+
+
+def estimate_flatfield(file_paths, resize_factor=1.0, samples=60,
+                       sigma=51.0, verbose=True):
+    """
+    Per-pixel median across a random sample of tiles, heavily blurred.
+
+    Background dominates each tile, so the median approximates the
+    illumination profile; the blur then strips whatever real content
+    leaked through, leaving only the low-frequency shading. Normalised to
+    mean 1.0 so dividing by it preserves overall brightness.
+    """
+    import random as _random
+    paths = list(file_paths)
+    if not paths:
+        return None
+    picks = _random.sample(paths, min(int(samples), len(paths)))
+    stack = []
+    for p in picks:
+        raw = cv2.imread(str(p))
+        if raw is None:
+            continue
+        if resize_factor != 1.0:
+            h, w = raw.shape[:2]
+            raw = cv2.resize(raw, (int(w * resize_factor), int(h * resize_factor)))
+        stack.append(cv2.cvtColor(raw, cv2.COLOR_BGR2RGB).astype(np.float32))
+    if not stack:
+        return None
+    # Tiles are not guaranteed to be pixel-identical in size -- measured
+    # 20x (92,91) and 5x (92,92) in Euglena_tiles/5x5_ecoli, which makes a
+    # naive np.stack raise. Crop every sample to the common minimum before
+    # stacking; _photometric_correct() then resizes the result to whatever
+    # each individual tile actually is.
+    mh = min(a.shape[0] for a in stack)
+    mw = min(a.shape[1] for a in stack)
+    stack = [a[:mh, :mw] for a in stack]
+    ff = np.median(np.stack(stack), axis=0)
+    ff = cv2.GaussianBlur(ff, (0, 0), float(sigma))
+
+    # Normalise EACH CHANNEL by its OWN mean, not by one scalar mean across
+    # all three. These tiles are heavily colour-cast (measured B~170, G~128,
+    # R~20), so a global mean (~106) makes the red plane of ff ~0.19, and
+    # dividing red by that boosts it ~5x -- a violent red cast, not a
+    # correction. Per-channel normalisation removes only the SPATIAL
+    # variation and leaves the colour balance alone, which is the whole
+    # point of a flat field.
+    for c in range(ff.shape[2]):
+        m = float(ff[:, :, c].mean())
+        ff[:, :, c] /= max(m, 1e-6)
+
+    if verbose:
+        print(f"[FLATFIELD] estimated from {len(stack)} tiles "
+              f"(blur sigma={sigma}); per-channel range "
+              f"{ff.min():.3f}..{ff.max():.3f}")
+    return ff.astype(np.float32)
+
+
+# Module-level state so both the eager load path and _LazyTile._decode()
+# apply exactly the same correction (a lazy re-decode must not silently
+# skip it -- that would make lazy and eager runs disagree).
+_FLATFIELD = None    # HxWx3 float32, mean-normalised, or None
+_TILE_GAINS = None   # {coord: np.ndarray(3,) float32} once solved, or None
+_SHADING_CORR = None # np.ndarray (h, w, 3) float32 multiplicative correction, or None
+
+
+def _photometric_correct(img_rgb):
+    """Apply the flat-field correction if it is enabled+prepared."""
+    out = img_rgb
+    if _FLATFIELD is not None:
+        ff = _FLATFIELD
+        if ff.shape[:2] != out.shape[:2]:
+            # the field is smooth by construction, so resampling it to this
+            # tile's exact size is lossless in practice
+            ff = cv2.resize(ff, (out.shape[1], out.shape[0]),
+                            interpolation=cv2.INTER_LINEAR)
+        out = np.round(np.clip(out.astype(np.float32) / ff, 0, 255)).astype(np.uint8)
+    return out
+
+
+def prepare_photometric_correction(file_paths, resize_factor=1.0):
+    """Build the flat-field once, before the load loop."""
+    global _FLATFIELD
+    _FLATFIELD = None
+    paths = list(file_paths)
+    if not paths:
+        return
+
+    if CONFIG.get('flatfield_correction', False):
+        _FLATFIELD = estimate_flatfield(
+            paths, resize_factor,
+            samples=CONFIG.get('flatfield_samples', 60),
+            sigma=CONFIG.get('flatfield_sigma', 51.0))
+
+
+# STEP 5.6 : Per-tile gain compensation  (photometric)
+# ============================================================
+
+def solve_tile_gains(image_data, overlap_pairs, verbose=True):
+    """
+    One multiplicative gain per tile (per channel), solved over the whole
+    overlap graph at once.
+
+    Why this exists even though flat-field correction already runs: a flat
+    field is ONE spatial profile shared by every tile. It removes the
+    within-tile shading (measured: edge/centre 1.089 -> 1.018 on
+    whole_petri_fr) but is mathematically incapable of fixing a per-tile
+    scalar -- and that scalar is what is left of the halo. Measured on
+    whole_petri_fr AFTER flat-field, interior row r8 c6..c18:
+
+        G (luminance)  3.8% relative std across tiles
+        B/G ratio      5.8%
+        R/G ratio     37.6%
+
+    Auto-exposure/auto-white-balance drift over a 680-tile scan. Since R/G
+    drifts ~10x more than luminance, it shows up as colour banding at tile
+    pitch -- hence per-channel by default.
+
+    Model (Brown & Lowe style gain compensation, in log space so it stays a
+    linear least-squares): every neighbour pair (i, j) sharing an overlap
+    strip contributes
+
+        log g_i - log g_j = log(median_j) - log(median_i)
+
+    stacked into an over-determined system and solved with lstsq -- the same
+    shape as solve_global_translations() does for positions, over the same
+    pair graph.
+
+    Two guards, both load-bearing. Without them the solve happily explains
+    real scene differences as exposure: unregularised on whole_petri_fr it
+    produced gains spanning 0.178..2.654 (a 15x range) which would wreck the
+    image rather than fix it.
+      * gain_reg_lambda   -- pulls every log-gain toward 0.
+      * gain_max_logratio -- drops a pair whose strips disagree too much to
+                             be exposure (content mismatch/misregistration).
+      * gain_min_median   -- skips strips too dark for a ratio to mean
+                             anything.
+    Measured at lambda=0.3, cut=0.35: overlap mismatch down 51% (B) / 35%
+    (G) / 49% (R), gains held to 0.72..1.46.
+
+    Returns {coord: np.ndarray(3,) float32}, or None if nothing was solvable.
+    """
+    if not overlap_pairs:
+        return None
+
+    lam     = float(CONFIG.get('gain_reg_lambda', 0.3))
+    max_lr  = float(CONFIG.get('gain_max_logratio', 0.35))
+    min_med = float(CONFIG.get('gain_min_median', 15.0))
+    per_ch  = bool(CONFIG.get('gain_per_channel', True))
+
+    # --- measure each pair's two overlap strips once -------------------
+    # Subsampled 2x on both axes before the median: a median over ~45k
+    # samples is already stable well under the 1% we care about, and it
+    # keeps this affordable at ~1300 pairs (and cheaper under lazy loading,
+    # where each access re-decodes the tile).
+    obs = []
+    for pair in overlap_pairs:
+        c1, c2 = pair['coord1'], pair['coord2']
+        r1, r2 = pair['region1'], pair['region2']
+        try:
+            a = image_data[c1]['image'][r1['y']:r1['y'] + r1['height'],
+                                        r1['x']:r1['x'] + r1['width']]
+            b = image_data[c2]['image'][r2['y']:r2['y'] + r2['height'],
+                                        r2['x']:r2['x'] + r2['width']]
+        except Exception as e:
+            print(f"[GAIN] skipped {c1}<->{c2}: {e}")
+            continue
+        if a.size == 0 or b.size == 0:
+            continue
+        h = min(a.shape[0], b.shape[0])
+        w = min(a.shape[1], b.shape[1])
+        a = a[:h:2, :w:2].reshape(-1, 3).astype(np.float32)
+        b = b[:h:2, :w:2].reshape(-1, 3).astype(np.float32)
+        if a.size == 0 or b.size == 0:
+            continue
+        obs.append((c1, c2, np.median(a, axis=0), np.median(b, axis=0)))
+
+    if not obs:
+        print("[GAIN] no usable overlap strips -- gain compensation skipped")
+        return None
+
+    nodes = sorted({c for o in obs for c in (o[0], o[1])})
+    idx   = {c: i for i, c in enumerate(nodes)}
+    n     = len(nodes)
+    gains = np.ones((n, 3), dtype=np.float64)
+
+    print(f"\n[SUMMARY] GAIN COMPENSATION (lambda={lam}, "
+          f"|log ratio| cut={max_lr}, per_channel={per_ch}):")
+
+    n_ch = 3 if per_ch else 1
+    for ch in range(n_ch):
+        rows, rhs, wts = [], [], []
+        kept = rej = 0
+        for c1, c2, m1, m2 in obs:
+            v1 = float(m1[ch]) if per_ch else float(m1.mean())
+            v2 = float(m2[ch]) if per_ch else float(m2.mean())
+            if v1 < min_med or v2 < min_med:
+                rej += 1
+                continue
+            lr = float(np.log(v2) - np.log(v1))
+            if abs(lr) > max_lr:
+                rej += 1
+                continue
+            row = np.zeros(n)
+            row[idx[c1]] = 1.0
+            row[idx[c2]] = -1.0
+            rows.append(row)
+            rhs.append(lr)
+            wts.append(1.0)
+            kept += 1
+
+        if kept == 0:
+            print(f"   ch{ch}: no usable pairs (all rejected) -- gains left at 1.0")
+            continue
+
+        data_rows = np.asarray(rows)
+        data_rhs  = np.asarray(rhs)
+
+        # regularisation rows: lam * log g_i = 0 for every tile
+        for i in range(n):
+            row = np.zeros(n)
+            row[i] = 1.0
+            rows.append(row)
+            rhs.append(0.0)
+            wts.append(lam)
+
+        A = np.asarray(rows) * np.asarray(wts)[:, None]
+        b = np.asarray(rhs) * np.asarray(wts)
+        lg, *_ = np.linalg.lstsq(A, b, rcond=None)
+
+        before = float(np.abs(data_rhs).mean())
+        after  = float(np.abs(data_rows @ lg - data_rhs).mean())
+        g = np.exp(lg)
+        gains[:, ch] = g
+        pct = (1.0 - after / before) * 100.0 if before > 0 else 0.0
+        print(f"   ch{ch}: pairs kept={kept} rejected={rej} | "
+              f"|log ratio| {before:.4f} -> {after:.4f} ({pct:.0f}% better) | "
+              f"gains {g.min():.3f}..{g.max():.3f}")
+
+    if not per_ch:
+        gains[:, 1] = gains[:, 0]
+        gains[:, 2] = gains[:, 0]
+
+    return {c: gains[idx[c]].astype(np.float32) for c in nodes}
+
+
+# ============================================================
+# STEP 5.7 : Overlap-Driven Shading Correction
+# ============================================================
+# Estimates the shading field S(u,v) from the tiles' own disagreement in
+# their overlaps, instead of from a median stack of tile content
+# (estimate_flatfield / CONFIG['flatfield_correction']).
+#
+# WHY THIS EXISTS -- measured on the real data:
+#   * The median-stack flat field recovers a genuine, reproducible optical
+#     profile on real captures: centre/corner came out 0.925 / 0.920 / 0.919
+#     on 10x10_1 / whole_petri_fr / 3x3 -- same camera, same answer.
+#   * On tiles CUT FROM ONE IMAGE (7x7, 10x10_euglena_red, 5x5_ecoli, ...)
+#     the same estimator returns 1.000 / 1.015 / 0.953 -- no shared optical
+#     profile exists, so np.median across tiles returns the median of the
+#     CONTENT. Dividing by that injects a spurious, content-shaped
+#     correction, which is why the photometric pipeline slightly degrades
+#     those datasets while clearly helping real ones.
+#   * A per-tile SCALAR gain (STEP 5.6) cannot fix the halo either: after
+#     removing the scalar component from the averaged overlap ratio map, a
+#     4.2% spatial residual remained with a systematic +7% left->right
+#     gradient. That gradient IS the banding, and it is a within-tile
+#     spatial term by construction.
+#
+# THE MODEL
+#   Observed tile i:   O_i(u,v) = T(p) * S(u,v)
+#   where T is the true scene at canvas point p and S is one shading field
+#   shared by every tile (a property of the optics, not of the tile).
+#   Taking logs, for a canvas point p seen by BOTH tile i and tile j:
+#
+#       log S(u_i,v_i) - log S(u_j,v_j) = log O_i(u_i,v_i) - log O_j(u_j,v_j)
+#
+#   T cancels -- that is the whole trick. Each overlapping pixel gives one
+#   linear constraint on the DIFFERENCE of log S at two tile-local
+#   positions, with no reference to scene content at all.
+#
+# WHY IT IS SAFE ON SYNTHETIC DATA
+#   The right-hand side is measured disagreement. Tiles cut from one image
+#   agree in their overlaps, so every RHS is ~0, and with the zero-pull
+#   regulariser the solution is log S = 0 -- a flat field, a NO-OP. The
+#   correction is applied only in proportion to evidence that one is needed,
+#   unlike a median stack which always outputs something.
+#
+# SOLVING IT
+#   log S is solved on a coarse control grid (shading is low-frequency, so
+#   ~12x20 is the right basis) and upsampled. Constraints accumulate
+#   straight into the normal equations A^T A / A^T b -- A itself would be
+#   hundreds of thousands of rows and is never materialised. The system is a
+#   few hundred unknowns and solves instantly.
+
+def _shading_cell_index(u, v, h, w, gh, gw):
+    """Map tile-local pixel coords to a flat coarse-grid control-point index."""
+    gy = np.clip((v.astype(np.int64) * gh) // h, 0, gh - 1)
+    gx = np.clip((u.astype(np.int64) * gw) // w, 0, gw - 1)
+    return gy * gw + gx
+
+
+def solve_overlap_shading(image_data, transforms, overlap_pairs, verbose=True):
+    """
+    Solve one shading field shared by all tiles, from overlap disagreement.
+
+    Returns an (h, w, 3) float32 multiplicative correction (already 1/S and
+    mean-normalised to 1), or None if there was not enough evidence.
+    """
+    gh, gw   = CONFIG.get('shading_grid', (12, 20))
+    step     = int(CONFIG.get('shading_sample_step', 6))
+    lam_s    = float(CONFIG.get('shading_smooth_lambda', 4.0))
+    lam_0    = float(CONFIG.get('shading_zero_lambda', 0.05))
+    max_lr   = float(CONFIG.get('shading_max_logratio', 0.35))
+    min_v    = float(CONFIG.get('shading_min_value', 12.0))
+    max_amp  = float(CONFIG.get('shading_max_logamp', 0.5))
+    n_cells  = gh * gw
+
+    usable = [p for p in overlap_pairs
+              if p['coord1'] in transforms and p['coord2'] in transforms]
+    if not usable:
+        if verbose:
+            print("[SHADING] no registered overlap pairs -- skipped")
+        return None
+
+    ref_h, ref_w = image_data[usable[0]['coord1']]['image'].shape[:2]
+
+    AtA = [np.zeros((n_cells, n_cells), dtype=np.float64) for _ in range(3)]
+    Atb = [np.zeros(n_cells, dtype=np.float64) for _ in range(3)]
+    kept = [0, 0, 0]
+    rejected = [0, 0, 0]
+    before = [[], [], []]
+
+    for pair in usable:
+        c1, c2 = pair['coord1'], pair['coord2']
+        im1 = image_data[c1]['image']
+        im2 = image_data[c2]['image']
+        if im1.shape[:2] != (ref_h, ref_w) or im2.shape[:2] != (ref_h, ref_w):
+            continue                  # ragged edge tile -- skip, keeps indexing simple
+        o1 = transforms[c1][:2, 2]
+        o2 = transforms[c2][:2, 2]
+
+        # overlapping rectangle of the two tiles, in the reference frame
+        x0 = max(o1[0], o2[0]); x1 = min(o1[0] + ref_w, o2[0] + ref_w)
+        y0 = max(o1[1], o2[1]); y1 = min(o1[1] + ref_h, o2[1] + ref_h)
+        if (x1 - x0) < 8 or (y1 - y0) < 8:
+            continue
+        xs = np.arange(int(np.ceil(x0)), int(np.floor(x1)), step)
+        ys = np.arange(int(np.ceil(y0)), int(np.floor(y1)), step)
+        if xs.size < 2 or ys.size < 2:
+            continue
+        X, Y = np.meshgrid(xs, ys)
+        u1 = np.round(X - o1[0]).astype(np.int64); v1 = np.round(Y - o1[1]).astype(np.int64)
+        u2 = np.round(X - o2[0]).astype(np.int64); v2 = np.round(Y - o2[1]).astype(np.int64)
+        ok = ((u1 >= 0) & (u1 < ref_w) & (v1 >= 0) & (v1 < ref_h) &
+              (u2 >= 0) & (u2 < ref_w) & (v2 >= 0) & (v2 < ref_h))
+        if not ok.any():
+            continue
+        u1, v1, u2, v2 = u1[ok], v1[ok], u2[ok], v2[ok]
+
+        ca_all = _shading_cell_index(u1, v1, ref_h, ref_w, gh, gw)
+        cb_all = _shading_cell_index(u2, v2, ref_h, ref_w, gh, gw)
+
+        for ch in range(3):
+            a = im1[v1, u1, ch].astype(np.float64)
+            b = im2[v2, u2, ch].astype(np.float64)
+            good = (a > min_v) & (b > min_v)
+            if not good.any():
+                continue
+            r = np.log(a[good]) - np.log(b[good])
+            ca = ca_all[good]
+            cb = cb_all[good]
+            keep = np.abs(r) <= max_lr      # reject content / misregistration outliers
+            rejected[ch] += int((~keep).sum())
+            r = r[keep]
+            ca = ca[keep]
+            cb = cb[keep]
+            if r.size == 0:
+                continue
+            kept[ch] += int(r.size)
+            before[ch].append(np.abs(r))
+
+            # accumulate (e_ca - e_cb)(e_ca - e_cb)^T  and  (e_ca - e_cb) * r
+            M = AtA[ch]
+            np.add.at(M, (ca, ca), 1.0)
+            np.add.at(M, (cb, cb), 1.0)
+            np.add.at(M, (ca, cb), -1.0)
+            np.add.at(M, (cb, ca), -1.0)
+            np.add.at(Atb[ch], ca, r)
+            np.add.at(Atb[ch], cb, -r)
+
+    if sum(kept) == 0:
+        if verbose:
+            print("[SHADING] no usable constraints -- skipped")
+        return None
+
+    # --- regularisation -------------------------------------------------
+    # smoothness: neighbouring control points should agree (shading is
+    # low-frequency). zero-pull: with no evidence the answer is log S = 0,
+    # which is what makes this a no-op on data that does not need it, and
+    # also makes the normal-equation matrix positive definite.
+    Rs = np.zeros((n_cells, n_cells), dtype=np.float64)
+    for gy in range(gh):
+        for gx in range(gw):
+            i = gy * gw + gx
+            for dy, dx in ((0, 1), (1, 0)):
+                ny, nx = gy + dy, gx + dx
+                if ny >= gh or nx >= gw:
+                    continue
+                j = ny * gw + nx
+                Rs[i, i] += 1.0
+                Rs[j, j] += 1.0
+                Rs[i, j] -= 1.0
+                Rs[j, i] -= 1.0
+    reg = (lam_s ** 2) * Rs + (lam_0 ** 2) * np.eye(n_cells)
+
+    fields, stats = [], []
+    for ch in range(3):
+        x = np.linalg.solve(AtA[ch] + reg, Atb[ch])
+        x -= x.mean()                                 # gauge: shading is relative
+        x = np.clip(x, -max_amp, max_amp)
+        logS = x.reshape(gh, gw).astype(np.float32)
+        S = np.exp(cv2.resize(logS, (ref_w, ref_h), interpolation=cv2.INTER_CUBIC))
+        S /= max(float(S.mean()), 1e-6)               # preserve overall brightness
+        fields.append((1.0 / S).astype(np.float32))   # correction = 1/S
+        stats.append((float(np.abs(x).max()), float(S.min()), float(S.max())))
+
+    corr = np.stack(fields, axis=-1)
+
+    if verbose:
+        print(f"\n[SUMMARY] OVERLAP-DRIVEN SHADING (grid={gh}x{gw}, "
+              f"smooth={lam_s}, zero-pull={lam_0}):")
+        for ch in range(3):
+            b = np.concatenate(before[ch]) if before[ch] else np.zeros(1)
+            amp, smin, smax = stats[ch]
+            print(f"   ch{ch}: constraints kept={kept[ch]:7d} rejected={rejected[ch]:6d} | "
+                  f"mean |log ratio| in overlaps={b.mean():.4f} | "
+                  f"shading {smin:.3f}..{smax:.3f} (max |log S|={amp:.4f})")
+        flat = max(s[0] for s in stats)
+        if flat < 0.02:
+            print(f"   -> solved field is essentially FLAT (max |log S| = {flat:.4f}); "
+                  f"the tiles already agree in their overlaps, so this is a "
+                  f"no-op. Expected on tiles cut from a single source image.")
+    return corr
+
+
+class _LazyTile:
+    """
+    Drop-in replacement for the eager {'image', 'image_gray', 'filename'}
+    dict `load_image()` normally stores per tile. Supports the same
+    `entry['image']` / `entry['image_gray']` / `entry['filename']` access
+    every existing call site (blending, metrics, feature extraction,
+    visualization) already uses -- nothing downstream needs to change -- but
+    re-decodes the tile from disk on every access instead of holding pixels
+    in RAM. Gated by CONFIG['lazy_tile_loading'] (off by default).
+
+    Deliberately does NOT cache the decoded array: caching would let the
+    working set creep back up toward "every tile touched so far stays in
+    RAM," defeating the point on a large grid (e.g. hundreds of tiles) where
+    the goal is O(1)-tile peak memory, not O(N). The tradeoff is re-decoding
+    a tile once per access (a handful of times per tile across registration
+    + blending) instead of once ever -- worth it only when RAM, not I/O, is
+    the constraint (a memory-limited device with fast onboard storage, per
+    correction.txt's "trades a little I/O for a lot of headroom").
+    """
+    __slots__ = ('path', 'filename', 'resize_factor', 'registration_channel')
+
+    def __init__(self, path, filename, resize_factor, registration_channel):
+        self.path = path
+        self.filename = filename
+        self.resize_factor = resize_factor
+        self.registration_channel = registration_channel
+
+    def _decode(self):
+        raw = cv2.imread(str(self.path))
+        if raw is None:
+            raise FileNotFoundError(f"[LAZY-LOAD] Gagal memuat ulang: {self.path}")
+        img_rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+        if self.resize_factor != 1.0:
+            h, w = img_rgb.shape[:2]
+            img_rgb = cv2.resize(img_rgb, (int(w * self.resize_factor), int(h * self.resize_factor)))
+        # same photometric correction the eager path applies, so a lazy
+        # re-decode can never disagree with an eager load
+        return _photometric_correct(img_rgb)
+
+    def __getitem__(self, key):
+        if key == 'filename':
+            return self.filename
+        if key == 'image':
+            return self._decode()
+        if key == 'image_gray':
+            return _registration_gray(self._decode(), self.registration_channel)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def load_image(folder_path, resize_factor=1.0, registration_channel=None):
     """
     Load all tile images from *folder_path*.
 
@@ -215,27 +923,47 @@ def load_image(folder_path, resize_factor=1.0):
     * ``Focused_<x>_<y>.jpg``    -- real-stage coordinates
     * ``tile_r<row>_c<col>.jpg`` -- grid indices (col->x, row->y)
     * ``..._r<row>_c<col>_....jpg`` -- grid indices embedded anywhere in a
-      longer filename carrying extra metadata (e.g. capture timestamp, a
-      session hash, a save timestamp -- as in
-      ``IMG_20260831030147_6d37fc_r0_c0_20260831_030313.jpg`` from
-      Euglena_tiles/E_Coli_5x5). Matched with `.search()` rather than
-      `.match()` so surrounding text is ignored; only the r_/c_ indices
-      matter (col->x, row->y, same as the plain tile_r_c pattern).
+      longer filename carrying extra metadata (matched with `.search()`).
+    * ``IMG_r<row>_c<col>.jpg``  -- the date-stripped short form
+      (as in Euglena_tiles/E_Coli_5x5 after renaming).
+
+    *registration_channel* (default CONFIG['registration_channel']) chooses
+    which single channel goes into 'image_gray', the array the shift search
+    consumes; 'image' always keeps the full RGB tile.
 
     Returns
     -------
     image_data : dict  {(x, y): {'image', 'image_gray', 'filename'}}
     grid_info  : dict  {'dimensions', 'x_range', 'y_range', 'unique_x', 'unique_y'}
     """
+    if registration_channel is None:
+        registration_channel = CONFIG.get('registration_channel', 'gray')
     folder_path = Path(folder_path)
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder '{folder_path}' tidak ditemukan")
 
     focused_pattern  = re.compile(r'Focused_(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)\.jpg')
     tile_pattern     = re.compile(r'tile_r(\d+)_c(\d+)\.jpg')
-    embedded_pattern = re.compile(r'_r(\d+)_c(\d+)_', re.IGNORECASE)
+    embedded_pattern = re.compile(r'_r(\d+)_c(\d+)(?:_|\.)', re.IGNORECASE)
+
+    # Build the flat-field ONCE from a sample of real tiles,
+    # before any tile is stored (default on for this script; see CONFIG
+    # comments -- no-op if a dataset does not need it, per
+    # solve_overlap_shading()'s sibling reasoning in brute_force.py).
+    def _parses_as_tile(p):
+        name = p.name
+        if focused_pattern.match(name):
+            return True
+        if tile_pattern.match(name):
+            return True
+        if embedded_pattern.search(name):
+            return True
+        return False
+    prepare_photometric_correction(
+        [p for p in folder_path.glob("*.jpg") if _parses_as_tile(p)], resize_factor)
 
     image_data = {}
+    skipped_empty = []
     for file_path in folder_path.glob("*.jpg"):
         name = file_path.name
         coords = None
@@ -264,21 +992,63 @@ def load_image(folder_path, resize_factor=1.0):
             if resize_factor != 1.0:
                 h, w = img_rgb.shape[:2]
                 img_rgb = cv2.resize(img_rgb, (int(w * resize_factor), int(h * resize_factor)))
-            image_data[coords] = {
-                'image':      img_rgb,
-                'image_gray': cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY),
-                'filename':   name,
-            }
+            img_rgb = _photometric_correct(img_rgb)
+            if CONFIG.get('skip_empty_tiles', False):
+                check_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+                if _tile_is_empty(check_gray, CONFIG.get('empty_tile_min_std', 8.0),
+                                  CONFIG.get('empty_tile_sigma', 12.0)):
+                    skipped_empty.append((coords, name))
+                    continue
+
+            if CONFIG.get('lazy_tile_loading', False):
+                # Discard the pixels just decoded above (only needed to
+                # validate the file and run the empty-tile check) and store a
+                # handle that reloads from disk on first real access instead.
+                # Peak RAM here is O(1) tile during this loop, and O(1) tile
+                # again whenever something later touches
+                # image_data[coord]['image'/'image_gray'] -- never O(N tiles)
+                # at once, unlike the eager dict below.
+                image_data[coords] = _LazyTile(file_path, name, resize_factor,
+                                               registration_channel)
+            else:
+                image_data[coords] = {
+                    'image':      img_rgb,
+                    'image_gray': _registration_gray(img_rgb, registration_channel),
+                    'filename':   name,
+                }
         except Exception as e:
             print(f"[ERROR] Gagal memuat {name}: {e}")
             traceback.print_exc()
 
+    if skipped_empty:
+        print(f"[DISH-MASK] Skipped {len(skipped_empty)} empty/background tile(s) "
+              f"(high-pass std <= {CONFIG.get('empty_tile_min_std', 8.0)}, "
+              f"sigma={CONFIG.get('empty_tile_sigma', 12.0)}): "
+              f"{[c for c, _ in skipped_empty][:10]}"
+              f"{' ...' if len(skipped_empty) > 10 else ''}")
+
     if not image_data:
-        raise ValueError("Tidak ada gambar yang ditemukan di folder.")
+        raise ValueError(
+            "Tidak ada gambar yang ditemukan di folder."
+            + (" Semua tile terdeteksi kosong -- periksa "
+               "CONFIG['empty_tile_min_std'] (mungkin terlalu tinggi)."
+               if skipped_empty else "")
+        )
 
     x_coords = [c[0] for c in image_data]
     y_coords = [c[1] for c in image_data]
-    unique_x = sorted(set(x_coords), reverse=True)
+    # X sorts descending by default (unlike Y, which is ascending) --
+    # historically tuned for the Focused_<x>_<y> real-stage-coordinate
+    # convention, where the physical X axis can genuinely run opposite to
+    # pixel/column-index direction on some rigs. For grid-index filenames
+    # (tile_r_c / embedded _r_c_, where column count increases in the same
+    # direction as pixels), this asymmetry makes calculate_overlap() pair
+    # every horizontal neighbour with the wrong physical edge -- confirmed
+    # on a real dataset where 0/504 horizontal pairs registered while
+    # vertical (which has no such asymmetry) partially did. Flip
+    # CONFIG['x_axis_descending'] to False for column-index datasets if
+    # horizontal registration is failing near-totally.
+    unique_x = sorted(set(x_coords), reverse=CONFIG.get('x_axis_descending', True))
     unique_y = sorted(set(y_coords))
 
     grid_info = {
@@ -289,6 +1059,7 @@ def load_image(folder_path, resize_factor=1.0):
         'unique_y':   unique_y,
     }
     print(f"{len(image_data)} gambar dimuat dari {folder_path}")
+    print(f"Registrasi pada kanal : {registration_channel}")
     print(f"Dimensi Grid  : {grid_info['dimensions'][0]} x {grid_info['dimensions'][1]}")
     print(f"Rentang X     : {grid_info['x_range']}")
     print(f"Rentang Y     : {grid_info['y_range']}")
@@ -465,9 +1236,20 @@ def extract_overlap_features(image_data, overlap_pairs, method='sift'):
         try:
             gray1 = image_data[coord1]['image_gray']
             roi1  = gray1[r1['y']:r1['y'] + r1['height'], r1['x']:r1['x'] + r1['width']]
-            # Apply CLAHE to the ROI crop before detection to improve keypoint
-            # density on low-contrast agar images.  Applied only to the crop,
-            # NOT to the stored image_gray, so photometric metrics are unaffected.
+            # CLAHE on the ROI crop before detection, to raise keypoint density on
+            # low-contrast agar.  Applied only to the crop, NOT to the stored
+            # image_gray, so photometric metrics remain unaffected.
+            #
+            # KEEP THIS -- it is the measured best for a SIFT matcher, and it is
+            # deliberately NOT what SP_LG.py does (that one feeds SuperPoint raw).
+            # SIFT is already invariant to affine intensity change (gradient
+            # orientations, L2-normalised descriptors), so it needs no photometric
+            # normalisation; its failure mode here is keypoint STARVATION on flat
+            # agar, which is exactly what CLAHE fixes. Measured on 40 real pairs of
+            # 10x10 against the shipped brute_force run's shifts: CLAHE 71 px median
+            # error / 13% of pairs within 10 px, versus raw 156 px / 3% and highpass
+            # 110 px / 5%.  z-score was also tried and is a no-op (SIFT cancels it by
+            # construction).  See PREPROCESSING_STUDY.md.
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             roi1 = clahe.apply(roi1)
             kp1, feat1 = select_descriptor(roi1, method)
@@ -592,51 +1374,60 @@ def _print_matching_summary(match_result, total_pairs, successful_pairs, total_m
 # STEP 5 : Homography via RANSAC
 # ============================================================
 
-def calculate_homography(kp1, kp2, matches, reproj_thresh, scale_bounds=None):
-    """Estimate transformation from matched keypoints.
+def calculate_homography(kp1, kp2, matches, reproj_thresh, region1=None, region2=None):
+    """Estimate a pure 2-DOF translation from matched keypoints.
 
-    Uses estimateAffinePartial2D (4 DOF: translation + rotation + uniform
-    scale) instead of findHomography (8 DOF) because the CNC stage only
-    translates in X and Y.  A full perspective model has 6 free parameters
-    to absorb noise from repeated colony patterns, making RANSAC susceptible
-    to confident-looking but geometrically wrong solutions.  The affine
-    result is promoted to a 3×3 matrix for compatibility with warpPerspective.
+    This rig only translates the stage in X/Y -- there is no rotation or
+    scale to estimate. estimateAffinePartial2D's 4-DOF model only needs 2
+    point correspondences to solve exactly, so a RANSAC "success" backed by
+    2-3 inliers is an unverified minimal sample, not a real estimate (see
+    correction.txt). The median of per-match displacement vectors IS the
+    robust estimator here: one correspondence determines the whole model,
+    so no RANSAC sampling is needed, and there is no rotation/scale for
+    outliers to be absorbed into.
+
+    If *region1*/*region2* (the pair's own overlap regions from
+    calculate_overlap()) are given, matches whose displacement is farther
+    than CONFIG['stage_prior_window'] from the geometrically-expected shift
+    are excluded from the median seed -- this discards matches that are
+    geometrically impossible given the known tile layout, which Lowe's
+    ratio test alone won't catch on repetitive/self-similar texture.
     """
-    if len(matches) <= 4:
+    if len(matches) < 3:
         return None
 
     pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
-    # estimateAffinePartial2D: 4 DOF (tx, ty, rotation, uniform scale)
-    # Much more robust on repetitive colony domains than full 8DOF homography.
-    H_affine, status = cv2.estimateAffinePartial2D(
-        pts1, pts2, method=cv2.RANSAC,
-        ransacReprojThreshold=reproj_thresh
-    )
-    if H_affine is None:
+    d = pts2 - pts1
+
+    if region1 is not None and region2 is not None:
+        expected = np.float32([region2['x'] - region1['x'],
+                                region2['y'] - region1['y']])
+        window = CONFIG.get('stage_prior_window', 50.0)
+        plausible = np.abs(d - expected).max(axis=1) < window
+    else:
+        plausible = np.ones(len(d), dtype=bool)
+    if plausible.sum() < 3:
         return None
-    det = np.linalg.det(H_affine[:, :2])
-    # Reject a degenerate similarity transform (near-zero rotation/scale
-    # determinant) -- RANSAC can return one when inliers are few or
-    # near-collinear. A singular H is unusable for warpPerspective and
-    # would blow up np.linalg.inv() later in build_transformation_graph.
-    if abs(det) < 1e-6:
+
+    tx, ty = np.median(d[plausible], axis=0)
+    # Final inlier accounting runs over ALL matches (not just the plausible
+    # subset) against this seed, so real matches near the stage-prior window
+    # edge still count -- the prior only protects the seed from corruption.
+    inlier_mask = np.abs(d - [tx, ty]).max(axis=1) < reproj_thresh
+    min_count = CONFIG.get('min_inlier_count', 10)
+    if inlier_mask.sum() < min_count:
         return None
-    # Reject an implausible uniform scale too (see CONFIG['affine_scale_bounds']):
-    # a stray scale of e.g. 50x compounds multiplicatively across the BFS
-    # transform chain and produces a canvas many orders of magnitude too big.
-    scale_lo, scale_hi = scale_bounds or (0.5, 2.0)
-    scale = np.sqrt(abs(det))
-    if not (scale_lo <= scale <= scale_hi):
-        return None
-    # Promote 2×3 affine matrix to 3×3 for warpPerspective compatibility
+    tx, ty = d[inlier_mask].mean(axis=0)   # refine on inliers only
+
     H = np.eye(3, dtype=np.float64)
-    H[:2, :] = H_affine
+    H[0, 2] = tx
+    H[1, 2] = ty
+    status = inlier_mask.astype(np.uint8).reshape(-1, 1)
     return (matches, H, status)
 
 
 def calculate_homographies_batch(image_data, match_result, reproj_thresh=4):
-    scale_bounds = CONFIG.get('affine_scale_bounds', (0.5, 2.0))
     homography_results = {}
     success = failed = 0
 
@@ -644,29 +1435,38 @@ def calculate_homographies_batch(image_data, match_result, reproj_thresh=4):
         try:
             result = calculate_homography(
                 info['keypoints1'], info['keypoints2'],
-                info['matches'], reproj_thresh, scale_bounds
+                info['matches'], reproj_thresh,
+                info.get('region1'), info.get('region2')
             )
             if result is None:
-                print(f"[SKIP] {coord1}↔{coord2}: <4 matches or degenerate/implausible transform")
+                print(f"[SKIP] {coord1}↔{coord2}: too few matches or inconsistent displacement")
                 failed += 1
                 continue
 
             matches, H, status = result
-            if H is None:
-                print(f"[SKIP] {coord1}↔{coord2}: findHomography returned None")
+            inliers = int(np.sum(status)) if status is not None else 0
+            n       = len(matches)
+            inlier_ratio = inliers / n if n else 0
+
+            min_ratio = CONFIG.get('min_inlier_ratio', 0.3)
+            min_count = CONFIG.get('min_inlier_count', 10)
+            if inliers < min_count or inlier_ratio < min_ratio:
+                print(f"[SKIP] {coord1}↔{coord2}: only {inliers}/{n} inliers "
+                      f"({inlier_ratio:.2f}) -- below min_inlier_count={min_count} "
+                      f"/ min_inlier_ratio={min_ratio}")
                 failed += 1
                 continue
 
-            inliers = int(np.sum(status)) if status is not None else 0
             homography_results[(coord1, coord2)] = {
                 'homography_matrix': H,
                 'inliers':           inliers,
-                'total_matches':     len(matches),
-                'inlier_ratio':      inliers / len(matches) if matches else 0,
+                'total_matches':     n,
+                'inlier_ratio':      inlier_ratio,
                 'direction':         info['direction'],
                 'status':            status,
+                'source':            'measured',
             }
-            print(f"   OK {coord1}↔{coord2}: {inliers}/{len(matches)} inliers")
+            print(f"   OK {coord1}↔{coord2}: {inliers}/{n} inliers")
             success += 1
         except Exception as e:
             print(f"[ERROR] Homography failed {coord1}↔{coord2}: {e}")
@@ -682,7 +1482,34 @@ def calculate_homographies_batch(image_data, match_result, reproj_thresh=4):
         ratios = [r['inlier_ratio'] for r in homography_results.values()]
         print(f"   Avg inlier ratio: {np.mean(ratios):.3f} "
               f"(min {min(ratios):.3f}, max {max(ratios):.3f})")
+    _print_translation_stats(homography_results)
     return homography_results
+
+
+def _print_translation_stats(homography_results):
+    """Print the measured tx/ty spread per direction (correction.txt step 1).
+
+    A fixed-XY stage should report nearly the same translation for every
+    horizontal pair, and the same for every vertical pair. A tight std here
+    (roughly stage jitter, e.g. 8-15px) means registration is healthy and
+    grid_adjust_outlier_tol / stage_prior_window can be tuned tightly around
+    it. A std in the hundreds means registration itself is broken -- no
+    amount of outlier-tolerance tuning will fix that; look at match quality
+    (Root cause 2 in correction.txt) instead.
+    """
+    if not homography_results:
+        return
+    by_dir = defaultdict(list)
+    for (c1, c2), info in homography_results.items():
+        H = info['homography_matrix']
+        by_dir[_ga_pair_direction(c1, c2)].append((float(H[0, 2]), float(H[1, 2])))
+
+    print(f"\n📊 TRANSLATION SPREAD (per direction):")
+    for d, rows in by_dir.items():
+        tx = np.array([r[0] for r in rows])
+        ty = np.array([r[1] for r in rows])
+        print(f"   {d:10s}: tx med={np.median(tx):7.1f} std={tx.std():6.1f} | "
+              f"ty med={np.median(ty):7.1f} std={ty.std():6.1f} | n={len(rows)}")
 
 
 # ============================================================
@@ -763,18 +1590,53 @@ def _print_reprojection_summary(results):
 # STEP 5 (cont.) : Transformation Graph
 # ============================================================
 
+def add_nominal_fallback_edges(homography_results, overlap_pairs, verbose=True):
+    """
+    For every geometrically-expected adjacent pair (from calculate_overlap())
+    that failed registration entirely, inject a nominal-shift homography
+    derived from the pair's own overlap-region geometry, instead of just
+    dropping the edge. A dropped edge fragments the transformation graph --
+    exactly what turns "100 tiles" into "2 reachable tiles" once enough pairs
+    fail. Nominal edges are tagged 'source': 'nominal_fallback' so callers
+    can report how many were needed, distinguishing assumed from measured.
+    """
+    if not CONFIG.get('use_nominal_fallback', True):
+        return homography_results
+
+    added = 0
+    for pair in overlap_pairs:
+        key = (pair['coord1'], pair['coord2'])
+        if key in homography_results:
+            continue
+        r1, r2 = pair['region1'], pair['region2']
+        H = np.eye(3, dtype=np.float64)
+        H[0, 2] = r2['x'] - r1['x']
+        H[1, 2] = r2['y'] - r1['y']
+        homography_results[key] = {
+            'homography_matrix': H,
+            'inliers':           0,
+            'total_matches':     0,
+            'inlier_ratio':      0.0,
+            'direction':         pair['direction'],
+            'status':            None,
+            'source':            'nominal_fallback',
+        }
+        added += 1
+
+    if verbose and added:
+        print(f"[FALLBACK] added {added} nominal-shift edge(s) for pair(s) that "
+              f"failed registration, to keep the transformation graph connected")
+    return homography_results
+
+
 def build_transformation_graph(homography_results):
     graph = defaultdict(dict)
     for (c1, c2), info in homography_results.items():
         H = info['homography_matrix']
-        # calculate_homography() already rejects near-singular H via a
-        # determinant check, but guard the inverse anyway -- belt-and-braces
-        # against any degenerate matrix reaching here, since an uninvertible
-        # edge is unusable for the graph in either direction.
         try:
             H_inv = np.linalg.inv(H)
         except np.linalg.LinAlgError:
-            print(f"[SKIP] {c1}<->{c2}: singular homography matrix, dropping edge")
+            print(f"[WARN] Skipping singular homography for edge {c1}↔{c2}")
             continue
         graph[c1][c2] = H
         graph[c2][c1] = H_inv
@@ -856,12 +1718,262 @@ def calculate_all_transforms(image_data, homography_results):
     return transforms, reference, reachable_images
 
 
+# ============================================================
+# STEP 5 (cont.) : Global Translation Adjustment  (self-contained)
+# ============================================================
+# Drop-in alternative to the BFS `calculate_all_transforms` above. Instead of
+# chaining pairwise transforms along one path from a reference tile -- which
+# lets each pair's small error ACCUMULATE with distance from the reference
+# (the "staircase drift" at the mosaic corners on large grids) -- this solves
+# every tile's translation into the reference frame AT ONCE by least squares.
+# Each registered pair (c1, c2) with 3x3 transform H contributes one linear
+# constraint per axis:
+#
+#         t_c1 - t_c2 = (H[0,2], H[1,2])
+#
+# The stacked system A t = b is over-determined; np.linalg.lstsq finds the
+# tile positions that best satisfy ALL pairs simultaneously. For a spanning
+# tree this reproduces the BFS chain exactly; every loop-closing edge adds a
+# constraint that spreads the error evenly instead of trusting one chain.
+# Only the TRANSLATION part of H is used -- the right model for a fixed XY
+# stage, where any per-pair rotation/scale an estimator reports is noise.
+#
+# Gated by CONFIG['use_global_adjustment']; the pre-filter tolerance is
+# CONFIG['grid_adjust_outlier_tol'].  (Previously in stitch_global_adjust.py,
+# inlined here so each pipeline script stands alone.)
+
+def _ga_pair_direction(c1, c2):
+    """'horizontal' if the two tiles share a grid row (differ in x only),
+    'vertical' if they share a column. Coords are grid indices."""
+    if c1[1] == c2[1]:
+        return 'horizontal'
+    if c1[0] == c2[0]:
+        return 'vertical'
+    return 'other'
+
+
+def _ga_connected_component(adj, start):
+    seen = {start}
+    q = deque([start])
+    while q:
+        n = q.popleft()
+        for m in adj[n]:
+            if m not in seen:
+                seen.add(m)
+                q.append(m)
+    return seen
+
+
+def _adaptive_tol(vals, floor=5.0, k=3.0):
+    """Robust per-axis tolerance from the median absolute deviation, instead
+    of a fixed guess. A fixed absolute tolerance rejects a growing fraction
+    of legitimate pairs as grid extent (and thus the true per-pair spread)
+    grows with it -- see correction.txt. 1.4826*MAD is a consistent estimator
+    of std for Gaussian-like noise; `floor` keeps tight, low-noise spreads
+    from being over-rejected on sub-pixel jitter."""
+    vals = np.asarray(vals, dtype=np.float64)
+    mad = float(np.median(np.abs(vals - np.median(vals))))
+    return max(floor, k * 1.4826 * mad)
+
+
+def reject_grid_outliers(homography_results, tol, verbose=True):
+    """
+    Fixed-stage prior: every horizontal pair should report the same
+    translation, every vertical pair the same. Drop any MEASURED pair whose
+    translation deviates from its direction's median by more than a
+    tolerance, BEFORE the least-squares solve (plain L2 is not
+    outlier-robust, so one bad pair would smear its error across the whole
+    grid).
+
+    *tol*: None -> no-op (skip filtering). 'adaptive' -> derive a robust
+    per-direction, per-axis tolerance from the measured spread itself (see
+    _adaptive_tol) instead of a fixed guess. A number -> that fixed px
+    tolerance on both axes, as before.
+
+    Two rules that matter when nominal-fallback edges are present (see
+    add_nominal_fallback_edges):
+      1. The reference median/tolerance is computed from 'measured' edges
+         ONLY when any exist for that direction. Nominal-fallback edges are
+         synthetic (generated from the same formula every time), so mixing
+         them into the population would collapse the computed spread toward
+         zero once they outnumber real measurements, backwards-rejecting
+         genuinely good real measurements that legitimately disagree with
+         the assumed grid geometry (this is not hypothetical: it is exactly
+         what happened on a 540-tile run where 89% of pairs fell back).
+      2. Nominal-fallback edges are NEVER rejected here -- they exist
+         specifically to keep the transformation graph connected when real
+         registration fails, and their low weight in the least-squares
+         solve (CONFIG['nominal_fallback_weight']) already limits their
+         influence. Rejecting them too would just re-fragment the graph.
+
+    Returns (kept_dict, rejected_keys).
+    """
+    if tol is None or not homography_results:
+        return homography_results, []
+
+    by_dir = defaultdict(list)
+    by_dir_measured = defaultdict(list)
+    for (c1, c2), info in homography_results.items():
+        H = info['homography_matrix']
+        row = ((c1, c2), float(H[0, 2]), float(H[1, 2]))
+        d = _ga_pair_direction(c1, c2)
+        by_dir[d].append(row)
+        if info.get('source', 'measured') == 'measured':
+            by_dir_measured[d].append(row)
+
+    stat_rows = {d: (by_dir_measured[d] if by_dir_measured.get(d) else rows)
+                 for d, rows in by_dir.items()}
+
+    median = {
+        d: (float(np.median([r[1] for r in rows])),
+            float(np.median([r[2] for r in rows])))
+        for d, rows in stat_rows.items()
+    }
+
+    adaptive = (tol == 'adaptive')
+    tol_xy = {}
+    if adaptive:
+        for d, rows in stat_rows.items():
+            tx_tol = _adaptive_tol([r[1] for r in rows])
+            ty_tol = _adaptive_tol([r[2] for r in rows])
+            tol_xy[d] = (tx_tol, ty_tol)
+            if verbose:
+                n_meas = len(by_dir_measured.get(d, []))
+                print(f"[GLOBAL-ADJ] adaptive tolerance ({d}): "
+                      f"tx_tol={tx_tol:.1f}px ty_tol={ty_tol:.1f}px "
+                      f"(from {n_meas} measured / {len(by_dir[d])} total)")
+
+    kept, rejected = {}, []
+    for (c1, c2), info in homography_results.items():
+        if info.get('source') == 'nominal_fallback':
+            kept[(c1, c2)] = info
+            continue
+        d = _ga_pair_direction(c1, c2)
+        mx, my = median[d]
+        tx_tol, ty_tol = tol_xy[d] if adaptive else (tol, tol)
+        H = info['homography_matrix']
+        if abs(float(H[0, 2]) - mx) > tx_tol or abs(float(H[1, 2]) - my) > ty_tol:
+            rejected.append((c1, c2))
+        else:
+            kept[(c1, c2)] = info
+
+    if verbose and rejected:
+        print(f"[GLOBAL-ADJ] rejected {len(rejected)} grid-inconsistent "
+              f"pair(s) from row/col median before solve")
+    return kept, rejected
+
+
+def _ga_select_reference(adj):
+    """Most-connected tile, tie-broken by proximity to the grid centre --
+    mirrors select_reference_image()."""
+    counts = {c: len(nb) for c, nb in adj.items()}
+    max_conn = max(counts.values())
+    candidates = [c for c, n in counts.items() if n == max_conn]
+    cx = sum(c[0] for c in adj) / len(adj)
+    cy = sum(c[1] for c in adj) / len(adj)
+    return min(candidates, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
+
+
+def solve_global_translations(homography_results, image_data,
+                              reference=None, outlier_tol=None, verbose=True):
+    """
+    Least-squares solve for every tile's pure-translation transform into the
+    reference frame. Drop-in replacement for calculate_all_transforms():
+
+        transforms, reference, reachable_images = \
+            solve_global_translations(homography_results, image_data, ...)
+
+    transforms[coord] is a 3x3 translation matrix (identity for the
+    reference). Tiles not connected to the reference are omitted, exactly
+    like the BFS version.
+
+    Edges tagged 'source': 'nominal_fallback' (see add_nominal_fallback_edges)
+    are down-weighted (CONFIG['nominal_fallback_weight'], default 0.1)
+    relative to measured edges (weight 1.0) via a standard weighted-least-
+    squares trick: scale each constraint row/target by sqrt(weight) before
+    the ordinary lstsq solve. They keep the graph connected but shouldn't be
+    trusted as much as a real measurement (see correction.txt).
+    """
+    hr, _ = reject_grid_outliers(homography_results, outlier_tol, verbose)
+    if not hr:                         # everything rejected -> fall back
+        hr = homography_results
+
+    adj = defaultdict(set)
+    for (c1, c2) in hr:
+        adj[c1].add(c2)
+        adj[c2].add(c1)
+    if not adj:
+        return {}, reference, []
+
+    if reference is None or reference not in adj:
+        reference = _ga_select_reference(adj)
+
+    component = _ga_connected_component(adj, reference)
+    solve_nodes = [c for c in component if c != reference]
+    col = {c: i for i, c in enumerate(solve_nodes)}
+    m = len(solve_nodes)
+
+    transforms = {reference: np.eye(3)}
+    reachable = [reference]
+
+    if m > 0:
+        nominal_weight = CONFIG.get('nominal_fallback_weight', 0.1)
+        rows, bx, by, weights = [], [], [], []
+        for (c1, c2), info in hr.items():
+            if c1 not in component or c2 not in component:
+                continue
+            H = info['homography_matrix']
+            row = np.zeros(m)
+            if c1 != reference:
+                row[col[c1]] += 1.0
+            if c2 != reference:
+                row[col[c2]] -= 1.0
+            rows.append(row)
+            bx.append(float(H[0, 2]))
+            by.append(float(H[1, 2]))
+            weights.append(nominal_weight if info.get('source') == 'nominal_fallback' else 1.0)
+
+        A = np.asarray(rows)
+        bx = np.asarray(bx)
+        by = np.asarray(by)
+        sw = np.sqrt(np.asarray(weights))
+        A_w  = A * sw[:, None]
+        bx_w = bx * sw
+        by_w = by * sw
+        tx, *_ = np.linalg.lstsq(A_w, bx_w, rcond=None)
+        ty, *_ = np.linalg.lstsq(A_w, by_w, rcond=None)
+
+        if verbose:
+            res = np.sqrt((A @ tx - bx) ** 2 + (A @ ty - by) ** 2)
+            n_nominal = int(np.sum(sw < 1.0))
+            print(f"[GLOBAL-ADJ] solved {A.shape[0]} constraints "
+                  f"({n_nominal} nominal-fallback, weight={nominal_weight}) for "
+                  f"{m + 1} tiles | per-pair residual px: "
+                  f"mean={res.mean():.2f} median={np.median(res):.2f} "
+                  f"max={res.max():.2f}")
+
+        for c in solve_nodes:
+            T = np.eye(3)
+            T[0, 2] = tx[col[c]]
+            T[1, 2] = ty[col[c]]
+            transforms[c] = T
+            reachable.append(c)
+
+    if verbose:
+        n_total = len(image_data) if image_data is not None else len(component)
+        print(f"[GLOBAL-ADJ] reference={reference} | "
+              f"reachable {len(reachable)}/{n_total}")
+    return transforms, reference, reachable
+
+
 def calculate_optimal_canvas(image_data, transforms):
-    all_corners = []
+    all_corners  = []
+    corner_coord = []
     for coord, T in transforms.items():
         h, w = image_data[coord]['image'].shape[:2]
         corners = np.float32([[0,0],[w,0],[w,h],[0,h]]).reshape(-1,1,2)
         all_corners.extend(cv2.perspectiveTransform(corners, T).reshape(-1, 2))
+        corner_coord.extend([coord] * 4)
 
     arr    = np.array(all_corners)
     min_xy = arr.min(axis=0)
@@ -870,25 +1982,30 @@ def calculate_optimal_canvas(image_data, transforms):
 
     canvas_w = int(max_xy[0] - min_xy[0]) + 2 * pad
     canvas_h = int(max_xy[1] - min_xy[1]) + 2 * pad
+
+    # Sanity cap: a real N-tile grid never gets remotely close to this. If we
+    # hit it, it means a bad accumulated transform pushed a tile far off the
+    # mosaic -- not that the mosaic is genuinely huge -- so fail fast with a
+    # diagnostic pointing at the outlier tile(s) instead of trying to
+    # allocate a multi-gigapixel canvas and dying with a raw MemoryError.
+    max_mp = CONFIG.get('max_canvas_megapixels', 100)
+    if canvas_w * canvas_h > max_mp * 1_000_000:
+        outlier_idx = {int(arr[:, 0].argmin()), int(arr[:, 0].argmax()),
+                       int(arr[:, 1].argmin()), int(arr[:, 1].argmax())}
+        outliers = sorted({corner_coord[i] for i in outlier_idx})
+        raise RuntimeError(
+            f"calculate_optimal_canvas: would need {canvas_w}x{canvas_h} "
+            f"({canvas_w * canvas_h / 1e6:.0f} MP), exceeding "
+            f"CONFIG['max_canvas_megapixels']={max_mp}. This almost always "
+            f"means at least one accumulated transform is wrong, not that "
+            f"the mosaic is really this big. Suspect tile(s): {outliers} -- "
+            f"check their pairwise homographies/inlier ratios (or set "
+            f"CONFIG['use_global_adjustment']=True), or raise "
+            f"max_canvas_megapixels if this size is genuinely expected."
+        )
+
     offset_x = int(-min_xy[0]) + pad
     offset_y = int(-min_xy[1]) + pad
-
-    # Last-resort guard: a physically plausible canvas is bounded by grid
-    # size * tile size (every tile placed end-to-end, no overlap). Blowing
-    # past this means a bad homography (implausible scale/translation) got
-    # composed across the BFS transform chain -- fail loudly here with a
-    # diagnosable message instead of trying (and failing) to allocate a
-    # multi-terabyte canvas array.
-    max_tile_dim = max(max(d['image'].shape[:2]) for d in image_data.values())
-    sane_limit   = max_tile_dim * (len(image_data) + 2)
-    if canvas_w > sane_limit or canvas_h > sane_limit:
-        raise RuntimeError(
-            f"Canvas size {canvas_w}x{canvas_h} is implausible for {len(image_data)} "
-            f"tile(s) of max dimension {max_tile_dim}px (sane limit ~{sane_limit}px/side). "
-            f"This means at least one accepted homography is geometrically wrong -- check "
-            f"the per-pair inlier ratios/scale printed above, or tighten "
-            f"CONFIG['affine_scale_bounds']."
-        )
 
     print(f"   Canvas  : {canvas_w} × {canvas_h}")
     print(f"   Offset  : ({offset_x}, {offset_y})")
@@ -1019,8 +2136,43 @@ def compute_rmse(img1, img2, norm_method='none'):
     return float(np.sqrt(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
 
 
+def _tile_bbox(image_data, coord, T_adj, canvas_w, canvas_h, pad=0):
+    """Warped bounding box of one tile under T_adj, clamped to the canvas.
+
+    Warping a tile into this tile-sized box instead of the full canvas is
+    the "windowed warp" from correction.txt -- cv2.warpPerspective's output
+    size is the single biggest memory cost in detect_pairwise_overlap() and
+    blend_panorama(), and a tile only ever covers a small fraction of a
+    large mosaic's canvas (a 20x20 grid's per-tile transient is ~2.5GB under
+    a whole-canvas warp).
+
+    *pad*: extra margin (px) added around the tile's own footprint. Since
+    every transform here is a pure translation, a warped tile is an
+    axis-aligned rectangle that exactly fills its own tight bbox -- with
+    pad=0 there is NO zero-background pixel anywhere in the window, which
+    silently breaks blend_panorama()'s cv2.erode()/distanceTransform() (they
+    need real zero-padding around the shape to compute the feather falloff
+    correctly; without it cv2.erode's border handling treats the window
+    edge as foreground). blend_panorama() must pass pad >= its feather
+    reach; detect_pairwise_overlap() has no morphology step and is exact
+    with pad=0.
+    """
+    h, w = image_data[coord]['image'].shape[:2]
+    corners = np.float32([[0,0],[w,0],[w,h],[0,h]]).reshape(-1,1,2)
+    wc = cv2.perspectiveTransform(corners, T_adj).reshape(-1, 2)
+    x0 = max(0, int(np.floor(wc[:,0].min())) - pad)
+    y0 = max(0, int(np.floor(wc[:,1].min())) - pad)
+    x1 = min(canvas_w, int(np.ceil(wc[:,0].max())) + pad)
+    y1 = min(canvas_h, int(np.ceil(wc[:,1].max())) + pad)
+    return x0, y0, x1, y1
+
+
 def detect_pairwise_overlap(image_data, transforms, coord1, coord2,
                              canvas_w, canvas_h, offset_x, offset_y):
+    """Windowed warp: both tiles are warped into the union of their own
+    bounding boxes, not the full canvas. Their overlap (intersection) is
+    always fully contained within that union, so this is exact -- just
+    cheaper than a full-canvas warp for two tiles on a large mosaic."""
     offset_matrix = np.array([[1,0,offset_x],[0,1,offset_y],[0,0,1]], dtype=np.float32)
 
     img1 = image_data[coord1]['image'].astype(np.float32)
@@ -1028,8 +2180,16 @@ def detect_pairwise_overlap(image_data, transforms, coord1, coord2,
     T1   = offset_matrix @ transforms[coord1]
     T2   = offset_matrix @ transforms[coord2]
 
-    w1 = cv2.warpPerspective(img1, T1, (canvas_w, canvas_h))
-    w2 = cv2.warpPerspective(img2, T2, (canvas_w, canvas_h))
+    bx0_1, by0_1, bx1_1, by1_1 = _tile_bbox(image_data, coord1, T1, canvas_w, canvas_h)
+    bx0_2, by0_2, bx1_2, by1_2 = _tile_bbox(image_data, coord2, T2, canvas_w, canvas_h)
+    x0, y0 = min(bx0_1, bx0_2), min(by0_1, by0_2)
+    x1, y1 = max(bx1_1, bx1_2), max(by1_1, by1_2)
+    if x1 <= x0 or y1 <= y0:
+        return None, None, None, 0
+    T_shift = np.array([[1,0,-x0],[0,1,-y0],[0,0,1]], dtype=np.float32)
+
+    w1 = cv2.warpPerspective(img1, T_shift @ T1, (x1 - x0, y1 - y0))
+    w2 = cv2.warpPerspective(img2, T_shift @ T2, (x1 - x0, y1 - y0))
 
     mask1 = (w1.sum(axis=2) > 0).astype(np.uint8)
     mask2 = (w2.sum(axis=2) > 0).astype(np.uint8)
@@ -1169,182 +2329,160 @@ def _print_metric_summary(results):
 # ============================================================
 
 def blend_panorama(image_data, transforms, reachable_images,
-                   canvas_w, canvas_h, offset_x, offset_y, feather_distance=None):
+                   canvas_w, canvas_h, offset_x, offset_y):
     """
     Warp and feather-blend all reachable tiles onto a single canvas.
 
-    Memory-efficient two-pass strategy
+    Windowed-warp strategy
     -----------------------------------
-    Pass 1 -- warp each tile once to build overlap_count, then discard the
-              warp immediately.  Only one full-canvas float32 image lives in
-              RAM at a time.
-    Pass 2 -- re-warp each tile and blend it into the canvas immediately,
-              then discard the warp.
+    Each tile is warped into its OWN bounding box (see _tile_bbox()), not
+    the full canvas -- cv2.warpPerspective's output size is the single
+    biggest memory cost here, and a tile only ever covers a small fraction
+    of a large mosaic's canvas (see correction.txt: a 20x20 grid's per-tile
+    transient alone is ~2.5GB under a whole-canvas warp). The persistent
+    canvas/weight_map/overlap_count buffers are still canvas-sized --
+    blending is inherently cumulative across tiles -- but the per-tile
+    transient drops from O(canvas_size) to O(tile_bbox_size), which is what
+    actually exhausts memory on large grids.
 
-    For an N-tile mosaic the old approach kept N warped canvases in RAM
-    simultaneously (e.g. ~7.5 GB for 25 × 300 MB tiles).  The new approach
-    peak RAM is O(canvas_size), regardless of N.
+    Accumulate-then-normalise compositing (correction.txt)
+    --------------------------------------------------------
+    Every tile adds a weighted contribution to `canvas`/`weight_map`; the
+    single normalising divide happens once, at the very end, in the same
+    strip loop that replaces the old full-canvas copy chain. This replaces
+    sequential alpha-over compositing with a running `max(ext_w, cur_w)`
+    weight tracker, which is only correct for exactly two overlapping
+    tiles -- wrong (and order-dependent) at any pixel touched by 3+ tiles,
+    i.e. every interior grid intersection. That was a real correctness bug
+    (a checkerboard-with-bright-intersections pattern), not just a memory
+    one; this fixes both at once, since accumulate-then-normalise also
+    removes the overlap_here/new_here branching and its overlap_count
+    dependency entirely -- "first touch" and "Nth touch" are the same code
+    path once canvas/weight_map start at zero.
 
-    feather_distance : width in px of the soft blend transition at tile
-        seams. Defaults to CONFIG['feather_distance']. <= 0 switches to a
-        hard, winner-take-all seam instead: each overlap pixel goes
-        entirely to whichever tile is more "interior" there (larger
-        distance-to-its-own-edge), no color mixing -- for an
-        analysis/training copy where blended/ghosted seam pixels are
-        undesirable (matches CONFIG['analysis_feather_distance']). Naively
-        passing feather_distance=0 into the old soft-blend formula divided
-        by zero (silently producing inf/nan at seams) -- this is the fix
-        for that, not just a threshold tweak.
+    Pass 1 -- warp each tile into its own bbox to build overlap_count (kept
+              for the debug/stats output only -- the blend itself no longer
+              needs it), then discard the small warp immediately.
+    Pass 2 -- re-warp each tile into its own bbox, accumulate its weighted
+              contribution into the canvas, then discard the warp.
+
+    Final conversion is done in row-strips, in-place: `canvas[valid]` /
+    `np.clip(...)` / `.astype(...)` on the un-strip version each
+    materialise a full canvas-sized copy (3 extra full buffers stacked on
+    top of the already-resident ones, right at the end of the run -- the
+    actual peak-memory moment on a large grid, not the loop). `np.unique`
+    is likewise replaced with `np.bincount` for the overlap-count histogram
+    (no full sort).
+
+    Returns
+    -------
+    final      : np.uint8  (H, W, 3)  -- blended panorama
+    debug_info : dict  -- overlap_count, weight_map, valid_pixels, overlap_stats
     """
-    feather_distance = CONFIG['feather_distance'] if feather_distance is None else feather_distance
-    hard_seam = feather_distance <= 0
-
-    offset_matrix = np.array([[1,0,offset_x],[0,1,offset_y],[0,0,1]], dtype=np.float32)
+    offset_matrix = np.array([[1, 0, offset_x],
+                               [0, 1, offset_y],
+                               [0, 0, 1]], dtype=np.float32)
 
     canvas        = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
     weight_map    = np.zeros((canvas_h, canvas_w),    dtype=np.float32)
     overlap_count = np.zeros((canvas_h, canvas_w),    dtype=np.int32)
 
-    # ------------------------------------------------------------------
-    # Pass 1 : accumulate overlap_count -- one warp in RAM at a time
-    # ------------------------------------------------------------------
+    # Every transform here is a pure translation, so a warped tile is an
+    # axis-aligned rectangle that exactly fills its own tight bbox -- no
+    # zero-background pixel would exist in the window without this margin,
+    # which breaks the erode()/distanceTransform() feather calculation
+    # below (see _tile_bbox()'s docstring). Must cover the erosion kernel's
+    # reach (2 iterations of 5x5 =~ 4px) plus the feather falloff distance.
+    feather_pad = int(CONFIG.get('feather_distance', 30)) + 10
+
     print(f"Pass 1 -- computing overlap map ({len(reachable_images)} tiles) ...")
     for coord in reachable_images:
         img   = image_data[coord]['image'].astype(np.float32)
         T_adj = offset_matrix @ transforms[coord]
-        w     = cv2.warpPerspective(img, T_adj, (canvas_w, canvas_h))
-        overlap_count += (w.sum(axis=2) > 0).astype(np.int32)
-        del w   # free immediately -- only one warped image in RAM at a time
-
-    # ------------------------------------------------------------------
-    # Pass 2 : blend -- one warp in RAM at a time
-    # ------------------------------------------------------------------
-    # The geometric warp + mask erode/distanceTransform stay on CPU via
-    # OpenCV regardless of feather_blend_device -- this build's OpenCV has
-    # no CUDA support (cv2.cuda.getCudaEnabledDeviceCount() == 0) and
-    # reimplementing warpPerspective's exact interpolation in PyTorch risks
-    # subtly changing stitching quality for a part that isn't the actual
-    # bottleneck. What moves to GPU when requested is the per-tile blend
-    # arithmetic below -- full 3-channel canvas-sized elementwise ops,
-    # repeated once per tile, which is what actually scales up on grids
-    # beyond ~5x5.
-    blend_device  = CONFIG.get('feather_blend_device', 'cpu')
-    requested_gpu = blend_device == 'cuda'
-    use_gpu       = requested_gpu and HAS_TORCH and torch.cuda.is_available()
-    if requested_gpu and not use_gpu:
-        print("[WARN] feather_blend_device='cuda' requested but CUDA is not available -- using CPU.")
+        x0, y0, x1, y1 = _tile_bbox(image_data, coord, T_adj, canvas_w, canvas_h, pad=feather_pad)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        T_local = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], dtype=np.float32) @ T_adj
+        small = cv2.warpPerspective(img, T_local, (x1 - x0, y1 - y0))
+        overlap_count[y0:y1, x0:x1] += (small.sum(axis=2) > 0).astype(np.int32)
+        del small
 
     kernel = np.ones((5, 5), np.uint8)
-    print(f"Pass 2 -- blending ({len(reachable_images)} tiles) ... [{'GPU' if use_gpu else 'CPU'}]")
-
-    if use_gpu:
-        canvas_t        = torch.zeros((canvas_h, canvas_w, 3), dtype=torch.float32, device='cuda')
-        weight_map_t    = torch.zeros((canvas_h, canvas_w),    dtype=torch.float32, device='cuda')
-        overlap_count_t = torch.from_numpy(overlap_count).to('cuda')
-
+    print(f"Pass 2 -- blending ({len(reachable_images)} tiles) ...")
     for coord in reachable_images:
         img    = image_data[coord]['image'].astype(np.float32)
+        if _TILE_GAINS is not None:
+            # Per-tile photometric gain (STEP 5.6). Applied here in Pass 2
+            # only: Pass 1 just builds overlap_count from `sum(axis=2) > 0`,
+            # and a positive gain cannot change whether a pixel is non-zero.
+            # Values may exceed 255 after scaling -- the strip conversion at
+            # the end of this function clips.
+            _g = _TILE_GAINS.get(coord)
+            if _g is not None:
+                img = img * _g
+        if _SHADING_CORR is not None and img.shape == _SHADING_CORR.shape:
+            # Overlap-driven shading correction (STEP 5.7). Same placement
+            # rationale as the gain above: Pass 1 only tests `sum(axis=2) > 0`
+            # and a positive multiplicative field cannot change that, so
+            # applying it in Pass 2 alone is consistent.
+            img = img * _SHADING_CORR
         T_adj  = offset_matrix @ transforms[coord]
-        warped = cv2.warpPerspective(img, T_adj, (canvas_w, canvas_h))
+        x0, y0, x1, y1 = _tile_bbox(image_data, coord, T_adj, canvas_w, canvas_h, pad=feather_pad)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        T_local = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], dtype=np.float32) @ T_adj
+        warped = cv2.warpPerspective(img, T_local, (x1 - x0, y1 - y0))
         mask   = (warped.sum(axis=2) > 0).astype(np.uint8)
 
-        inner = cv2.erode(mask, kernel, iterations=2)
-        dist  = cv2.distanceTransform(inner, cv2.DIST_L2, 5)
+        inner        = cv2.erode(mask, kernel, iterations=2)
+        dist         = cv2.distanceTransform(inner, cv2.DIST_L2, 5)
+        max_dist     = dist.max()
+        feather_zone = min(CONFIG['feather_distance'], max_dist * 0.3) if max_dist > 0 else 1
+        feather      = np.minimum(dist / feather_zone, 1.0) * mask.astype(np.float32)
 
-        if use_gpu:
-            warped_t = torch.from_numpy(warped).to('cuda')
-            mask_t   = torch.from_numpy(mask).to('cuda').bool()
-            dist_t   = torch.from_numpy(dist).to('cuda')
-            mask_f_t = mask_t.to(torch.float32)
+        # Accumulate-then-normalise: floor the feather so an edge pixel that
+        # legitimately has zero distance-transform weight (right at the tile
+        # boundary) still contributes instead of being silently dropped;
+        # re-apply the mask afterward so the floor never leaks outside the
+        # tile's real footprint.
+        feather = np.maximum(feather, 1e-3) * mask.astype(np.float32)
 
-            if hard_seam:
-                feather_t = dist_t * mask_f_t
-            else:
-                max_dist     = dist_t.max().item()
-                feather_zone = min(feather_distance, max_dist * 0.3) if max_dist > 0 else 1
-                feather_t    = torch.clamp(dist_t / feather_zone, max=1.0) * mask_f_t
+        # Views into the canvas-sized buffers, sliced to this tile's bbox --
+        # basic slicing returns a view, so in-place writes below apply
+        # straight through to canvas/weight_map with no explicit writeback.
+        canvas_slice = canvas[y0:y1, x0:x1]
+        weight_slice = weight_map[y0:y1, x0:x1]
 
-            overlap_here_t = (overlap_count_t * mask_t) > 1
-            new_here_t     = (weight_map_t == 0) & (feather_t > 0)
+        for c in range(3):
+            canvas_slice[:, :, c] += warped[:, :, c] * feather
+        weight_slice += feather
 
-            canvas_t[new_here_t]     = warped_t[new_here_t]
-            weight_map_t[new_here_t] = feather_t[new_here_t]
+        del warped
 
-            if overlap_here_t.any():
-                cur_w = feather_t[overlap_here_t]
-                ext_w = weight_map_t[overlap_here_t]
-                if hard_seam:
-                    win_mask_t = torch.zeros_like(mask_t)
-                    win_mask_t[overlap_here_t] = cur_w > ext_w
-                    canvas_t[win_mask_t] = warped_t[win_mask_t]
-                else:
-                    total = cur_w + ext_w
-                    alpha = torch.where(total != 0, cur_w / total, torch.zeros_like(cur_w))
-                    canvas_t[overlap_here_t] = (
-                        alpha.unsqueeze(-1) * warped_t[overlap_here_t] +
-                        (1 - alpha).unsqueeze(-1) * canvas_t[overlap_here_t]
-                    )
-                weight_map_t[overlap_here_t] = torch.maximum(ext_w, cur_w)
+    # canvas currently holds a WEIGHTED SUM (accumulate, not average, in the
+    # loop above), so this pass also does the single normalising divide --
+    # one division per pixel instead of one per tile-pair -- and it folds
+    # into the same strip loop that used to be the memory-spike site.
+    STRIP = 512
+    final = np.empty((canvas_h, canvas_w, 3), dtype=np.uint8)
+    for y0s in range(0, canvas_h, STRIP):
+        ys = slice(y0s, min(y0s + STRIP, canvas_h))
+        w = weight_map[ys][:, :, None]
+        np.divide(canvas[ys], w, out=canvas[ys], where=w > 1e-6)
+        np.clip(canvas[ys], 0, 255, out=canvas[ys])
+        final[ys] = canvas[ys].astype(np.uint8)
+        final[ys][weight_map[ys] <= 0] = 0
 
-            del warped, warped_t, mask_t, dist_t, feather_t  # free immediately
+    # np.unique(...) sorts the whole array (plus workspace) just to build a
+    # histogram of a handful of small integer values -- np.bincount doesn't.
+    counts = np.bincount(overlap_count.ravel())
+    overlap_stats = {i: int(c) for i, c in enumerate(counts) if c}
 
-        else:
-            if hard_seam:
-                # Priority score for winner-take-all ownership -- deliberately
-                # NOT capped to [0,1] the way the soft-blend alpha below is,
-                # since it's never used as a blend weight in this mode, only
-                # compared against other tiles' scores at the same pixel.
-                feather = dist * mask.astype(np.float32)
-            else:
-                max_dist     = dist.max()
-                feather_zone = min(feather_distance, max_dist * 0.3) if max_dist > 0 else 1
-                feather      = np.minimum(dist / feather_zone, 1.0) * mask.astype(np.float32)
-
-            overlap_here = (overlap_count * mask) > 1
-            new_here     = (weight_map == 0) & (feather > 0)
-
-            for c in range(3):
-                canvas[:,:,c][new_here] = warped[:,:,c][new_here]
-            weight_map[new_here] = feather[new_here]
-
-            if overlap_here.any():
-                cur_w  = feather[overlap_here]
-                ext_w  = weight_map[overlap_here]
-                if hard_seam:
-                    # No color mixing: each overlap pixel goes entirely to
-                    # whichever tile currently has the higher priority score.
-                    win_mask = np.zeros_like(mask, dtype=bool)
-                    win_mask[overlap_here] = cur_w > ext_w
-                    for c in range(3):
-                        canvas[:,:,c][win_mask] = warped[:,:,c][win_mask]
-                else:
-                    total  = cur_w + ext_w
-                    alpha  = np.divide(cur_w, total, out=np.zeros_like(cur_w), where=total != 0)
-                    for c in range(3):
-                        canvas[:,:,c][overlap_here] = (
-                            alpha * warped[:,:,c][overlap_here] +
-                            (1 - alpha) * canvas[:,:,c][overlap_here]
-                        )
-                weight_map[overlap_here] = np.maximum(ext_w, cur_w)
-
-            del warped  # free immediately
-
-    if use_gpu:
-        canvas     = canvas_t.cpu().numpy()
-        weight_map = weight_map_t.cpu().numpy()
-        del canvas_t, weight_map_t, overlap_count_t
-        torch.cuda.empty_cache()
-
-    valid     = weight_map > 0
-    final     = np.zeros_like(canvas, dtype=np.uint8)
-    final[valid] = np.clip(canvas[valid], 0, 255).astype(np.uint8)
-
-    unique_ov, counts_ov = np.unique(overlap_count, return_counts=True)
     debug_info = {
         'overlap_count': overlap_count,
         'weight_map':    weight_map,
-        'valid_pixels':  valid,
-        'overlap_stats': dict(zip(unique_ov.tolist(), counts_ov.tolist())),
+        'valid_pixels':  weight_map > 0,
+        'overlap_stats': overlap_stats,
     }
     return final, debug_info
 
@@ -1460,7 +2598,7 @@ def extract_roi(image, roi_info, padding=5):
 if __name__ == '__main__':
     import argparse
     _parser = argparse.ArgumentParser(description="SIFT + BFMatcher tile stitching")
-    _parser.add_argument('--path', default="/home/brin-microscope/Documents/Tugas-Akhir/Hardware/local_datasets/bfe9a132",
+    _parser.add_argument('--path', default="/home/brin-microscope/Documents/Tugas-Akhir/Hardware/Computer_Vision/Euglena_Tiles/10x10_euglena_red",
                          help="Folder of tile images to stitch")
     folder_path = _parser.parse_args().path
 
@@ -1495,10 +2633,11 @@ if __name__ == '__main__':
     if tracker:
         tracker.record_step("4. BFMatcher Feature Matching")
 
-    # Step 5 -- Homography via RANSAC
+    # Step 5 -- Translation estimation (2-DOF median, stage-prior filtered)
     homography_results = calculate_homographies_batch(image_data, match_result, CONFIG['reproj_thresh'])
+    homography_results = add_nominal_fallback_edges(homography_results, overlap_pairs)
     if tracker:
-        tracker.record_step("5. Homography RANSAC")
+        tracker.record_step("5. Translation Estimation")
 
     # Step 5.1 -- Reprojection error report
     if CONFIG.get('evaluate_metrics', False):
@@ -1506,7 +2645,17 @@ if __name__ == '__main__':
                                          output_csv="homography_reprojection_sift_bfm.csv")
 
     # Step 5.5 -- Overlap quality metrics (PSNR, SSIM, RMSE, NCC)
-    transforms, reference, reachable_images = calculate_all_transforms(image_data, homography_results)
+    if CONFIG.get('use_global_adjustment', True):
+        transforms, reference, reachable_images = solve_global_translations(
+            homography_results, image_data,
+            outlier_tol=CONFIG.get('grid_adjust_outlier_tol', 'adaptive'))
+    else:
+        transforms, reference, reachable_images = calculate_all_transforms(image_data, homography_results)
+    if len(reachable_images) < 0.9 * len(image_data):
+        print(f"[WARNING] Only {len(reachable_images)}/{len(image_data)} tiles reachable "
+              f"({len(reachable_images) / len(image_data) * 100:.1f}%) -- the mosaic is "
+              f"missing a significant fraction of tiles. Check registration quality "
+              f"(inlier ratios, TRANSLATION SPREAD) before trusting this result.")
     canvas_w, canvas_h, offset_x, offset_y  = calculate_optimal_canvas(image_data, transforms)
     if CONFIG.get('evaluate_metrics', False):
         evaluate_overlap_metrics(
@@ -1519,29 +2668,27 @@ if __name__ == '__main__':
     if tracker and CONFIG.get('evaluate_metrics', False):
         tracker.record_step("5.5 Overlap Quality Metrics Evaluation")
 
-    # Step 6 -- Feather blending
-    # Hard-seam analysis copy first (if enabled), display copy second -- in
-    # that order so this copy's own save message (deliberately NOT phrased
-    # "Saved: ...", see below) never becomes the last "Saved: <path>.jpg"
-    # match in the process output, which is what automate.py's tile-runner
-    # parses to find the stitched panorama. Keeps automate.py picking up
-    # the same (display) file it always has, unaffected by this addition.
-    if CONFIG.get('save_analysis_copy', False):
-        analysis_blended, _ = blend_panorama(
-            image_data, transforms, reachable_images,
-            canvas_w, canvas_h, offset_x, offset_y,
-            feather_distance=CONFIG.get('analysis_feather_distance', 0),
-        )
-        analysis_roi_info = find_roi(analysis_blended, min_threshold=1, debug=False)
-        analysis_result, _ = extract_roi(analysis_blended, analysis_roi_info, padding=10)
-        analysis_save_path = str(Path(folder_path) / "result_sift_bfm_analysis.jpg")
-        cv2.imwrite(analysis_save_path, cv2.cvtColor(analysis_result, cv2.COLOR_RGB2BGR))
-        print(f"[INFO] Hard-seam analysis copy written: {analysis_save_path}")
+    # Step 5.6 -- per-tile photometric gain compensation. Runs after
+    # registration (it reuses the same overlap pair graph) and before
+    # blending, which is the only consumer -- blend_panorama() reads
+    # the module-level _TILE_GAINS set here.
+    if CONFIG.get('gain_compensation', False):
+        _TILE_GAINS = solve_tile_gains(image_data, overlap_pairs)
+        if tracker:
+            tracker.record_step("5.6 Per-Tile Gain Compensation")
 
+    # Step 5.7 -- overlap-driven shading correction. Needs `transforms`
+    # (it works in the registered reference frame), so it runs after the
+    # global adjustment, and before blending, its only consumer.
+    if CONFIG.get('overlap_shading', False):
+        _SHADING_CORR = solve_overlap_shading(image_data, transforms, overlap_pairs)
+        if tracker:
+            tracker.record_step("5.7 Overlap-Driven Shading Correction")
+
+    # Step 6 -- Feather blending
     blended, debug_info = blend_panorama(
         image_data, transforms, reachable_images,
-        canvas_w, canvas_h, offset_x, offset_y,
-        feather_distance=CONFIG.get('display_feather_distance', CONFIG['feather_distance']),
+        canvas_w, canvas_h, offset_x, offset_y
     )
     if CONFIG.get('debug', False):
         visualize_blending_debug(debug_info, blended)
@@ -1555,6 +2702,12 @@ if __name__ == '__main__':
     save_path = str(Path(folder_path) / "result_sift_bfm.jpg")
     cv2.imwrite(save_path, cv2.cvtColor(final_result, cv2.COLOR_RGB2BGR))
     print(f"✅ Saved: {save_path}")
+    if CONFIG.get('save_preview', True):
+        scale   = CONFIG.get('preview_scale', 0.125)
+        preview = cv2.resize(final_result, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        preview_path = str(Path(save_path).with_name(Path(save_path).stem + "_preview" + Path(save_path).suffix))
+        cv2.imwrite(preview_path, cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
+        print(f"✅ Saved preview ({scale:.3f}x, {preview.shape[1]}x{preview.shape[0]}): {preview_path}")
     if tracker:
         tracker.record_step("6. Feather Blending, ROI Crop & Saving")
 
