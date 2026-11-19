@@ -20,6 +20,11 @@ import json
 import cv2
 import numpy as np
 
+try:
+    from Hardware.Computer_Vision import image_scale
+except ImportError:                      # dijalankan dari dalam Computer_Vision/
+    import image_scale
+
 
 def _p(params, key, default, cast=float):
     """Ambil params[key] dengan aman -> cast; kalau kosong/aneh pakai default."""
@@ -48,7 +53,12 @@ class ClassicCVImageEditor:
         # Normalisasi ekstensi -> .jpg supaya kontrak filename downstream stabil.
         stem, _ext = os.path.splitext(name)
         name = stem + ".jpg"
-        cv2.imwrite(os.path.join(self.output_dir, name), img)
+        out_path = os.path.join(self.output_dir, name)
+        cv2.imwrite(out_path, img)
+        # cv2.imwrite membuang segmen COM. Tak ada olahan di sini yang mengubah
+        # ukuran piksel (ROI hanya memotong), jadi skala µm/px sumber tetap
+        # berlaku -> salin kembali supaya luas koloni pada hasil olahan benar.
+        image_scale.copy_scale(image_path, out_path)
         return name
 
     # ── Image enhancement ────────────────────────────────────────────────
@@ -180,10 +190,13 @@ class ClassicCVImageEditor:
             return None
         h, w = img.shape[:2]
         um_per_px = _p(params, "umPerPx", None)
-        bar_um = _p(params, "barUm", 100.0)
+        if not um_per_px:   # default: skala nyata citra (tertanam / FOV tile), sumbu x
+            sc = image_scale.resolve_scale(image_path, w, h)
+            um_per_px = sc["um_per_px_x"] if sc else None
+        bar_um = _p(params, "barUm", 1000.0 if um_per_px else 100.0)
         if um_per_px and um_per_px > 0:
             bar_len = int(round(bar_um / um_per_px))
-            label = f"{bar_um:g} um"
+            label = f"{bar_um / 1000:g} mm" if bar_um >= 1000 else f"{bar_um:g} um"
         else:
             bar_len = w // 5
             label = _p(params, "label", f"{bar_um:g} um", str) if params else f"{bar_um:g} um"

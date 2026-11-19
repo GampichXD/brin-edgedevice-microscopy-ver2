@@ -14,6 +14,7 @@ try:
 except ImportError:
     requests = None
 from Hardware.Computer_Vision.classic_cv_edit import classic_cv_editor
+from Hardware.Computer_Vision import image_scale
 
 LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp_images"))
 if not os.path.exists(LOCAL_TMP_DIR):
@@ -76,16 +77,20 @@ _STITCH_MILESTONES = [
     ("Saved:",          96, "Menyimpan hasil"),
 ]
 
-# Bobot YOLO segmentation TensorRT (INT8) untuk perhitungan koloni -- lihat
-# Quantize_model/Weights/yolo_model/. .engine tidak menyimpan metadata task
-# seperti .pt, jadi task='segment' selalu di-pass eksplisit di bawah.
+# Bobot YOLO segmentation TensorRT (FP16, besttt, imgsz 1280) untuk perhitungan
+# koloni -- lihat Quantize_model/Weights/yolo_model/. Diganti dari
+# best_Seg_1280_int8.engine (2026-11-18): mask mAP50-95 0.623 vs 0.223 pada
+# test set asli. Engine dibangun di Jetson ini (TensorRT 10.3); rebuild bila
+# JetPack/TensorRT berubah (test_folder/test folder/model/besttt/export_engines.py).
+# .engine tidak menyimpan metadata task seperti .pt, jadi task='segment' selalu
+# di-pass eksplisit di bawah.
 COLONY_SCRIPT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "Computer_Vision", "Quantize_model", "colony_counting.py"
 ))
 COLONY_TIMEOUT_S = 300
 YOLO_SEG_MODEL = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "Computer_Vision", "Quantize_model",
-    "Weights", "yolo_model", "best_Seg_1280_int8.engine"
+    "Weights", "yolo_model", "besttt_FP16.engine"
 ))
 
 # Pola nama file hasil capture tile: "<prefix>_<timestamp>_X<x>_Y<y>.jpg"
@@ -214,22 +219,33 @@ def _stage_tiles_for_sp_lg(image_paths, stage_dir):
     return staged
 
 
-def _run_colony_count(input_path, output_dir, conf=0.25):
+def _run_colony_count(input_path, output_dir, conf=0.25, um_per_px=None):
     """
-    Jalankan model YOLO segmentation nyata (best_Seg_1280_int8.engine) lewat
+    Jalankan model YOLO segmentation nyata (YOLO_SEG_MODEL = besttt_FP16.engine) lewat
     colony_counting.count_colonies(), lalu salin hasil anotasinya ke nama
     lama 'yolo_<original>.jpg' supaya kontrak filename yang sudah dipakai
     downstream (event WebSocket, file JSON di static/uploads) tetap sama.
-    Return (legacy_filename, count) -- meniru signature colony_counter lama.
+    Return (legacy_filename, count, result) -- result = JSON lengkap dari
+    colony_counting (area_stats, histogram_path, areas_csv_path, ...).
+    um_per_px=(x, y) menimpa skala; default: skala tertanam di JPEG / FOV tile.
     """
     # Proses terpisah, sama seperti stitching: kehabisan memori GPU di TensorRT mematikan
     # proses secara langsung tanpa exception Python. Di proses utama, itu berarti koneksi
     # VPS, kamera, dan motor ikut mati. Memori GPU juga kembali bebas setelah selesai.
     os.makedirs(output_dir, exist_ok=True)
-    done = subprocess.run(
-        [sys.executable, "-u", COLONY_SCRIPT, "--image", input_path, "--model", YOLO_SEG_MODEL,
-         "--output-dir", output_dir, "--conf", str(conf), "--task", "segment"],
-        capture_output=True, text=True, timeout=COLONY_TIMEOUT_S)
+    cmd = [sys.executable, "-u", COLONY_SCRIPT, "--image", input_path, "--model", YOLO_SEG_MODEL,
+           "--output-dir", output_dir, "--conf", str(conf), "--task", "segment"]
+    if um_per_px:
+        cmd += ["--um-per-px"] + [str(v) for v in um_per_px]
+    for attempt in range(2):
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=COLONY_TIMEOUT_S)
+        oom = done.returncode != 0 and ("out of memory" in (done.stdout + done.stderr).lower()
+                                         or "NVML_SUCCESS" in done.stderr)
+        if not oom or attempt:
+            break
+        # OOM GPU di Jetson sering sesaat (memori dibagi dgn CPU); coba sekali lagi.
+        print("[BRIDGE AI] Colony counting kehabisan memori GPU — mencoba ulang dalam 5 dtk")
+        time.sleep(5)
     if done.returncode != 0:
         tail = " ".join((done.stderr or done.stdout).strip().splitlines()[-3:])
         if "out of memory" in (done.stdout + done.stderr).lower() or "NVML_SUCCESS" in done.stderr:
@@ -244,7 +260,102 @@ def _run_colony_count(input_path, output_dir, conf=0.25):
     if result["annotated_path"] and os.path.abspath(result["annotated_path"]) != os.path.abspath(legacy_path):
         shutil.copy2(result["annotated_path"], legacy_path)
 
-    return legacy_filename, result["count"]
+    return legacy_filename, result["count"], result
+
+
+def _colony_area_payload(result, report_name):
+    """Field tambahan CV_RESULT untuk luas koloni: statistik ringkas + histogram
+    PNG dan CSV per-koloni (base64/teks) dengan nama turunan dari report_name."""
+    stats = result.get("area_stats") or {}
+    out = {"area": {k: stats.get(k) for k in (
+        "unit", "length_unit", "n", "calibrated", "scale", "total", "mean", "median", "std",
+        "min", "max", "p10", "p90", "mean_eq_diameter", "hist_counts", "hist_edges")}}
+    stem = os.path.splitext(os.path.basename(report_name))[0]
+    hist = result.get("histogram_path")
+    if hist and os.path.exists(hist):
+        with open(hist, "rb") as f:
+            out["histogram_data"] = "data:image/png;base64," + base64.b64encode(f.read()).decode("utf-8")
+        out["histogram_filename"] = f"{stem}_area_hist.png"
+    csv_path = result.get("areas_csv_path")
+    if csv_path and os.path.exists(csv_path):
+        with open(csv_path, encoding="utf-8") as f:
+            out["areas_csv"] = f.read()
+        out["areas_csv_filename"] = f"{stem}_areas.csv"
+    return out
+
+
+def _morphology_stats(result):
+    """Statistik morfologi dari koloni hasil segmentasi YOLO (colony_counting).
+    Kunci total_cells/avg_area/avg_perimeter/total_area dipertahankan supaya
+    panel UI lama tetap terisi; satuan ikut kalibrasi (mm²/mm atau px²/px)."""
+    st = result.get("area_stats") or {}
+    cols = result.get("colonies") or []
+
+    def mean(key):
+        vals = [c[key] for c in cols if isinstance(c.get(key), (int, float))]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    r = (lambda v: round(float(v or 0.0), 6))
+    return {
+        "method": f"YOLO segmentation ({os.path.basename(YOLO_SEG_MODEL)})",
+        "unit": st.get("unit", "px²"),
+        "length_unit": st.get("length_unit", "px"),
+        "calibrated": bool(st.get("calibrated")),
+        "total_cells": int(st.get("n") or 0),
+        "total_area": r(st.get("total")),
+        "avg_area": r(st.get("mean")),
+        "median_area": r(st.get("median")),
+        "avg_perimeter": r(mean("perimeter")),
+        "avg_eq_diameter": r(mean("eq_diameter")),
+        "avg_circularity": round(mean("circularity"), 4),
+        "mask_mode": result.get("mask_mode", "full"),
+    }
+
+
+def _script_resize_factor(script_path):
+    """CONFIG['resize_factor'] dari skrip stitching (dibaca dari sumbernya
+    supaya selalu sinkron dengan nilai yang benar-benar dipakai)."""
+    try:
+        with open(script_path, encoding="utf-8") as f:
+            m = re.search(r"['\"]resize_factor['\"]\s*:\s*([0-9.]+)", f.read())
+        return float(m.group(1)) if m else 1.0
+    except (OSError, ValueError):
+        return 1.0
+
+
+def _first_image_dims(folder):
+    import cv2
+    for f in sorted(os.listdir(folder)):
+        if f.lower().endswith((".jpg", ".jpeg", ".png")):
+            img = cv2.imread(os.path.join(folder, f))
+            if img is not None:
+                return img.shape[1], img.shape[0]
+    return None
+
+
+def _tag_panorama_scale(pano_path, stage_dir, run_dir, script_path, model_key):
+    """Tanam µm/px panorama ke JPEG-nya. Skala = µm/px tile asli (FOV kamera /
+    dimensi tile) dibagi faktor pengecilan total: pra-skala grid besar/OOM
+    (run_dir vs stage_dir) x CONFIG['resize_factor'] skrip. Tile yang bukan
+    frame kamera (rasio aspek lain) -> tidak ditandai (luas tetap px²)."""
+    try:
+        orig = _first_image_dims(stage_dir)
+        used = _first_image_dims(run_dir) if run_dir != stage_dir else orig
+        if not orig or not used:
+            return None
+        tile = image_scale.tile_scale_for_dims(*orig)
+        if not tile:
+            print(f"[BRIDGE AI] Tile {orig[0]}x{orig[1]} bukan frame kamera — skala panorama tidak ditandai.")
+            return None
+        factor = (used[0] / orig[0]) * _script_resize_factor(script_path)
+        sx, sy = tile[0] / factor, tile[1] / factor
+        image_scale.write_scale(pano_path, sx, sy,
+                                f"stitch {model_key}: tile {orig[0]}x{orig[1]} x{factor:.3g}")
+        print(f"[BRIDGE AI] Skala panorama: {sx:.3f} x {sy:.3f} µm/px (faktor {factor:.3g})")
+        return sx, sy
+    except Exception as e:
+        print(f"[BRIDGE AI] Gagal menandai skala panorama: {e}")
+        return None
 
 
 # =====================================================================
@@ -519,6 +630,8 @@ async def _run_stitch_job(data, websocket, ws_lock, state):
             await emit_progress(98, "Mengunggah hasil")
             local_output = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
             shutil.copy2(expected, local_output)
+            await asyncio.to_thread(_tag_panorama_scale, local_output, stage_dir, run_dir,
+                                    script_path, model_key)
             with open(local_output, "rb") as f:
                 enc = base64.b64encode(f.read()).decode("utf-8")
             try:
@@ -576,11 +689,11 @@ async def handle_ai_action(action: str, data: dict, websocket, ws_lock, state=No
         return
 
     elif action == "START_DL_COUNT":
-        print("[BRIDGE AI] Menjalankan YOLO Segmentation Colony Counter (best_Seg_1280_int8)...")
+        print(f"[BRIDGE AI] Menjalankan YOLO Segmentation Colony Counter ({os.path.basename(YOLO_SEG_MODEL)})...")
         target_img = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
 
         try:
-            result_img, count_result = _run_colony_count(target_img, LOCAL_TMP_DIR)
+            result_img, count_result, _ = _run_colony_count(target_img, LOCAL_TMP_DIR)
         except Exception as e:
             print(f"[BRIDGE AI ERROR] Colony counting gagal: {e}")
             async with ws_lock:
@@ -650,14 +763,28 @@ async def handle_ai_action(action: str, data: dict, websocket, ws_lock, state=No
             out_dir = classic_cv_editor.output_dir
             extra = None
 
-            if tool == "CV_COLONY_COUNT":
+            if tool in ("CV_COLONY_COUNT", "CV_MORPHOLOGY"):
+                # Kalkulasi Morfologi memakai segmentasi YOLO yang sama dengan colony
+                # counter (luas dari mask, µm/px dari image_scale), bukan Otsu.
                 try:
                     conf = float(params.get("conf", 0.25))
                 except (TypeError, ValueError):
                     conf = 0.25
-                out_name, count = await asyncio.to_thread(_run_colony_count, src, out_dir, conf)
-                extra = {"colonies": int(count)}
-                print(f"[BRIDGE CV] YOLO colony count = {count} (conf={conf})")
+                try:
+                    ux = float(params["umPerPxX"]) if params.get("umPerPxX") not in (None, "") else None
+                    uy = float(params["umPerPxY"]) if params.get("umPerPxY") not in (None, "") else ux
+                except (TypeError, ValueError):
+                    ux = uy = None
+                out_name, count, cc = await asyncio.to_thread(
+                    _run_colony_count, src, out_dir, conf, (ux, uy) if ux else None)
+                if tool == "CV_COLONY_COUNT":
+                    extra = {"colonies": int(count)}
+                    print(f"[BRIDGE CV] YOLO colony count = {count} (conf={conf})")
+                else:
+                    extra = {"stats": _morphology_stats(cc)}
+                    print(f"[BRIDGE CV] YOLO morphology: {count} koloni, rata-rata luas "
+                          f"{extra['stats']['avg_area']} {extra['stats']['unit']} (conf={conf})")
+                extra.update(_colony_area_payload(cc, report_name or out_name))
             else:
                 method_name, extra_key = _CV_CLASSIC[tool]
                 method = getattr(classic_cv_editor, method_name)
