@@ -323,14 +323,22 @@ def _script_resize_factor(script_path):
         return 1.0
 
 
-def _first_image_dims(folder):
+def _first_tile_name(folder):
+    """Nama tile pertama di folder -- BUKAN hasil stitching. Skrip stitching
+    menulis result_<metode>.jpg ke folder yang sama dengan tile, dan nama itu
+    terurut sebelum tile_r0_c0.jpg; kalau ikut terbaca, skala panorama dihitung
+    dari ukuran panorama sendiri (bug 2026-11-19: 3.05 µm/px, seharusnya ~9.8)."""
+    names = sorted(f for f in os.listdir(folder)
+                   if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                   and not f.lower().startswith(("result", "stitched")))
+    tiles = [f for f in names if re.match(r"tile_r\d+_c\d+\.", f, re.IGNORECASE)]
+    return (tiles or names or [None])[0]
+
+
+def _image_dims(path):
     import cv2
-    for f in sorted(os.listdir(folder)):
-        if f.lower().endswith((".jpg", ".jpeg", ".png")):
-            img = cv2.imread(os.path.join(folder, f))
-            if img is not None:
-                return img.shape[1], img.shape[0]
-    return None
+    img = cv2.imread(path) if path and os.path.exists(path) else None
+    return (img.shape[1], img.shape[0]) if img is not None else None
 
 
 def _tag_panorama_scale(pano_path, stage_dir, run_dir, script_path, model_key):
@@ -339,8 +347,11 @@ def _tag_panorama_scale(pano_path, stage_dir, run_dir, script_path, model_key):
     (run_dir vs stage_dir) x CONFIG['resize_factor'] skrip. Tile yang bukan
     frame kamera (rasio aspek lain) -> tidak ditandai (luas tetap px²)."""
     try:
-        orig = _first_image_dims(stage_dir)
-        used = _first_image_dims(run_dir) if run_dir != stage_dir else orig
+        name = _first_tile_name(stage_dir)          # dibandingkan file tile yang SAMA
+        if not name:
+            return None
+        orig = _image_dims(os.path.join(stage_dir, name))
+        used = _image_dims(os.path.join(run_dir, name)) if run_dir != stage_dir else orig
         if not orig or not used:
             return None
         tile = image_scale.tile_scale_for_dims(*orig)
