@@ -284,7 +284,11 @@ async def telemetry_sender(websocket):
                     "soft_limits": motor_core.soft_limits,
                     "at_limit": motor_core.limit_flags(),
                     "z_units_per_step": motor_core.z_units_per_step,
-                    "camera_status": "BUSY" if edge_state.stitching else ("OK" if camera_core.is_alive() else "OFFLINE"),
+                    # BUSY saat stitching atau saat pipeline di-restart untuk pengaturan baru,
+                    # supaya web tidak menampilkan "kamera tidak merespons" untuk jeda yang disengaja.
+                    "camera_status": "BUSY" if (edge_state.stitching or getattr(camera_core, "applying", False))
+                    else ("OK" if camera_core.is_alive() else "OFFLINE"),
+                    "camera_settings": {"shutter_us": camera_core.shutter_speed, "iso": camera_core.iso},
                 }))
         except Exception:
             break

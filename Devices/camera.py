@@ -9,7 +9,11 @@ import atexit
 import re
 from datetime import datetime
 
-FRAME_STALE_NS = 5_000_000_000  # frame lebih tua dari ini berarti pipeline kamera sudah mati
+FRAME_STALE_NS = 5_000_000_000
+# Batas aman IMX477 pada pipeline 1920x1080@30 fps. Eksposur lebih lama dari satu frame
+# (1/30 s) atau gain di luar 1-22 membuat nvarguscamerasrc gagal start dan kamera mati.
+SHUTTER_MIN_US, SHUTTER_MAX_US = 13, 33000
+ISO_MIN, ISO_MAX = 100, 2200  # frame lebih tua dari ini berarti pipeline kamera sudah mati
 SAFE_CAPTURE_NAME = re.compile(r"[A-Za-z0-9._-]+\.(jpg|jpeg|png)")
 
 class IMX477CameraCore:
@@ -21,6 +25,7 @@ class IMX477CameraCore:
         self.cap = None
         self.shutter_speed = None
         self.iso = None
+        self.applying = False  # True selama pipeline di-restart untuk pengaturan baru
         self.proc = None
 
         # Threading untuk live streaming anti-blocking
@@ -307,10 +312,14 @@ class IMX477CameraCore:
             return self.jpeg_frame
 
     def apply_settings(self, shutter_speed=None, iso=None):
+        """Terapkan shutter (µs) dan ISO. Nilai dipotong ke rentang aman sensor. Kalau pipeline
+        gagal start dengan nilai baru, kembali ke nilai sebelumnya supaya kamera tidak mati.
+        Mengembalikan True kalau nilai baru berlaku."""
+        prev = (self.shutter_speed, self.iso)
         if shutter_speed is not None:
-            self.shutter_speed = int(float(shutter_speed))
+            self.shutter_speed = max(SHUTTER_MIN_US, min(SHUTTER_MAX_US, int(float(shutter_speed))))
         if iso is not None:
-            self.iso = int(float(iso))
+            self.iso = max(ISO_MIN, min(ISO_MAX, int(float(iso))))
 
         # Windows/OpenCV: coba set properti langsung.
         if self.cap is not None:
@@ -323,19 +332,30 @@ class IMX477CameraCore:
                 pass
             return True
 
-        # Jetson/GStreamer: props exposure/gain hanya bisa saat pipeline dibuat,
-        # jadi RESTART pipeline sekali dengan _gst_command() yang sudah memuat
-        # nilai baru. Kalau belum streaming, cukup simpan (berlaku saat dinyalakan).
-        if self.started and self.proc is not None:
+        # Jetson/GStreamer: exposure/gain hanya bisa diset saat pipeline dibuat, jadi pipeline
+        # di-restart. Kamera yang sedang mati juga dibuka ulang di sini, sehingga tombol
+        # Terapkan/Default bisa memulihkan kamera tanpa restart main.py.
+        was_running = self.started and self.proc is not None
+        self.applying = True
+        try:
             print(f"[CORE CAMERA] Menerapkan shutter={self.shutter_speed}µs iso={self.iso} (restart pipeline)...")
-            try:
+            if was_running:
                 self.close()
                 time.sleep(0.6)
-                return self.open()
-            except Exception as e:
-                print(f"[CORE CAMERA ERROR] Gagal restart untuk apply settings: {e}")
-                return False
-        return True
+            if self.open():
+                return True
+            print(f"[CORE CAMERA ERROR] Pipeline gagal dengan shutter={self.shutter_speed} iso={self.iso}; "
+                  f"kembali ke shutter={prev[0]} iso={prev[1]}.")
+            self.shutter_speed, self.iso = prev
+            self.close()
+            time.sleep(0.6)
+            self.open()
+            return False
+        except Exception as e:
+            print(f"[CORE CAMERA ERROR] Gagal restart untuk apply settings: {e}")
+            return False
+        finally:
+            self.applying = False
 
     def capture_to_bytes(self, quality=75):
         """Mengembalikan JPEG bytes untuk kompatibilitas backward."""

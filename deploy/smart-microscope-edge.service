@@ -1,0 +1,26 @@
+# Layanan systemd: menjalankan Hardware/main.py otomatis saat Jetson menyala
+# dan menyalakannya lagi kalau berhenti. Cara pasang: lihat deploy/README.md.
+[Unit]
+Description=Smart Digital Microscope - Edge (Hardware/main.py)
+# Tunggu jaringan dan layanan kamera Jetson siap.
+After=network-online.target nvargus-daemon.service
+Wants=network-online.target nvargus-daemon.service
+# Jangan berhenti mencoba walau gagal berkali-kali (mis. Wi-Fi belum tersambung).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=brin-microscope
+Group=brin-microscope
+SupplementaryGroups=dialout video
+WorkingDirectory=/home/brin-microscope/Documents/Tugas-Akhir/Hardware
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/brin-microscope/venvs/compvis/bin/python main.py
+Restart=always
+RestartSec=5
+# main.py menangkap SIGTERM lalu menutup kamera dan port serial dengan rapi.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
