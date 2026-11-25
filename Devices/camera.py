@@ -9,11 +9,7 @@ import atexit
 import re
 from datetime import datetime
 
-FRAME_STALE_NS = 5_000_000_000
-# Batas aman IMX477 pada pipeline 1920x1080@30 fps. Eksposur lebih lama dari satu frame
-# (1/30 s) atau gain di luar 1-22 membuat nvarguscamerasrc gagal start dan kamera mati.
-SHUTTER_MIN_US, SHUTTER_MAX_US = 13, 33000
-ISO_MIN, ISO_MAX = 100, 2200  # frame lebih tua dari ini berarti pipeline kamera sudah mati
+FRAME_STALE_NS = 5_000_000_000  # frame lebih tua dari ini berarti pipeline kamera sudah mati
 SAFE_CAPTURE_NAME = re.compile(r"[A-Za-z0-9._-]+\.(jpg|jpeg|png)")
 
 class IMX477CameraCore:
@@ -311,15 +307,17 @@ class IMX477CameraCore:
         with self.read_lock:
             return self.jpeg_frame
 
-    def apply_settings(self, shutter_speed=None, iso=None):
-        """Terapkan shutter (µs) dan ISO. Nilai dipotong ke rentang aman sensor. Kalau pipeline
+    def apply_settings(self, shutter_speed=None, iso=None, reset=False):
+        """Terapkan shutter (µs) dan ISO apa adanya; reset=True = otomatis. Kalau pipeline
         gagal start dengan nilai baru, kembali ke nilai sebelumnya supaya kamera tidak mati.
         Mengembalikan True kalau nilai baru berlaku."""
         prev = (self.shutter_speed, self.iso)
+        if reset:  # kembali ke eksposur otomatis, seperti saat main.py baru dinyalakan
+            self.shutter_speed = self.iso = None
         if shutter_speed is not None:
-            self.shutter_speed = max(SHUTTER_MIN_US, min(SHUTTER_MAX_US, int(float(shutter_speed))))
+            self.shutter_speed = int(float(shutter_speed))
         if iso is not None:
-            self.iso = max(ISO_MIN, min(ISO_MAX, int(float(iso))))
+            self.iso = int(float(iso))
 
         # Windows/OpenCV: coba set properti langsung.
         if self.cap is not None:

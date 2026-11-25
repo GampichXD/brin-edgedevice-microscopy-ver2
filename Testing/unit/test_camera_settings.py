@@ -1,4 +1,4 @@
-"""Pengaturan kamera: nilai dipotong ke batas sensor, dan kamera tidak dibiarkan mati
+"""Pengaturan kamera: nilai dipakai apa adanya, reset = otomatis, dan kamera tidak dibiarkan mati
 kalau pipeline gagal start dengan nilai baru (sebelumnya perlu restart main.py)."""
 from Hardware.Devices import camera as cam
 
@@ -26,12 +26,16 @@ def _fake_camera(monkeypatch, fail_when=None):
     return c, calls
 
 
-def test_nilai_dipotong_ke_batas_sensor(monkeypatch):
+def test_nilai_dipakai_apa_adanya(monkeypatch):
     c, _ = _fake_camera(monkeypatch)
     assert c.apply_settings(50000, 5000) is True
-    assert (c.shutter_speed, c.iso) == (cam.SHUTTER_MAX_US, cam.ISO_MAX)
-    c.apply_settings(1, 10)
-    assert (c.shutter_speed, c.iso) == (cam.SHUTTER_MIN_US, cam.ISO_MIN)
+    assert (c.shutter_speed, c.iso) == (50000, 5000)
+
+
+def test_reset_kembali_ke_otomatis(monkeypatch):
+    c, calls = _fake_camera(monkeypatch)
+    assert c.apply_settings(reset=True) is True
+    assert calls[-1] == ("open", None, None, True)
 
 
 def test_gagal_start_kembali_ke_nilai_lama(monkeypatch):

@@ -102,6 +102,7 @@ async def handle_camera_action(action: str, data: dict, websocket, ws_lock, stat
             camera_core.apply_settings,
             data.get("shutter_speed"),
             data.get("iso"),
+            bool(data.get("reset")),
         )
 
     elif action == "START_STREAM":
